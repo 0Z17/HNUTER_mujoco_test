@@ -3,7 +3,7 @@
 The default mission contains four intermediate waypoints with strongly varying
 roll, pitch, and yaw.  Consecutive poses are planned with OMPL RRTConnect, all
 segments are stitched by one interpolating cubic SE(3) B-spline, and a
-speed-limited minimum-jerk timing law feeds the existing pose MPPI controller.
+kinematic TOPP-RA timing law feeds the existing pose MPPI controller.
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ from ompl_se3_planner import (
     SE3Pose,
     SphereObstacle,
 )
+from toppra_retiming import ToppraTimedReference
 
 
 FloatArray = np.ndarray
@@ -56,7 +57,9 @@ DEFAULT_INTERMEDIATE_WAYPOINTS = (
 class MultiWaypointProblem:
     planner: OMPLSE3Planner
     path: PlannedSE3Path
-    reference: BSplineTimeParameterizedReference
+    reference: (
+        ToppraTimedReference | BSplineTimeParameterizedReference
+    )
     start: SE3Pose
     goal: SE3Pose
     intermediate_waypoints: tuple[SE3Pose, ...]
@@ -104,14 +107,32 @@ def create_multi_waypoint_problem(
         spline_samples=args.spline_samples,
         orientation_metric_weight=args.orientation_metric_weight,
     )
-    reference = BSplineTimeParameterizedReference(
-        multi_plan,
-        max_linear_speed=args.max_linear_speed,
-        max_angular_speed=args.max_angular_speed,
-        start_delay=args.start_delay,
-        duration_scale=args.duration_scale,
-        timing_samples=args.timing_samples,
-    )
+    if args.retimer == "toppra":
+        reference = ToppraTimedReference(
+            multi_plan,
+            max_linear_speed=args.max_linear_speed,
+            max_angular_speed=args.max_angular_speed,
+            max_linear_acceleration=args.max_linear_acceleration,
+            max_angular_acceleration=args.max_angular_acceleration,
+            start_delay=args.start_delay,
+            duration_scale=args.duration_scale,
+            gridpoint_count=args.toppra_gridpoints,
+            validation_point_count=args.toppra_validation_points,
+            max_refinement_iterations=(
+                args.toppra_refinement_iterations
+            ),
+            velocity_scale=args.velocity_scale,
+            acceleration_scale=args.acceleration_scale,
+        )
+    else:
+        reference = BSplineTimeParameterizedReference(
+            multi_plan,
+            max_linear_speed=args.max_linear_speed,
+            max_angular_speed=args.max_angular_speed,
+            start_delay=args.start_delay,
+            duration_scale=args.duration_scale,
+            timing_samples=args.timing_samples,
+        )
     intermediate_states = np.asarray(
         [
             np.concatenate(
@@ -371,10 +392,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spline-samples", type=int, default=1200)
     parser.add_argument("--timing-samples", type=int, default=4000)
     parser.add_argument(
+        "--retimer",
+        choices=("toppra", "minimum-jerk"),
+        default="toppra",
+    )
+    parser.add_argument("--toppra-gridpoints", type=int, default=401)
+    parser.add_argument(
+        "--toppra-validation-points", type=int, default=4001
+    )
+    parser.add_argument(
+        "--toppra-refinement-iterations", type=int, default=3
+    )
+    parser.add_argument(
         "--orientation-metric-weight", type=float, default=0.35
     )
     parser.add_argument("--max-linear-speed", type=float, default=1.05)
     parser.add_argument("--max-angular-speed", type=float, default=1.5)
+    parser.add_argument(
+        "--max-linear-acceleration",
+        type=float,
+        nargs=3,
+        default=(4.0, 4.0, 3.5),
+        metavar=("AX", "AY", "AZ"),
+    )
+    parser.add_argument(
+        "--max-angular-acceleration",
+        type=float,
+        nargs=3,
+        default=(6.0, 6.0, 5.0),
+        metavar=("ALPHA_X", "ALPHA_Y", "ALPHA_Z"),
+    )
+    parser.add_argument("--velocity-scale", type=float, default=0.85)
+    parser.add_argument(
+        "--acceleration-scale", type=float, default=0.80
+    )
     parser.add_argument("--duration-scale", type=float, default=1.08)
     parser.add_argument("--start-delay", type=float, default=0.35)
     parser.add_argument("--goal-hold", type=float, default=2.0)
@@ -447,10 +498,17 @@ def parse_args() -> argparse.Namespace:
         and args.spline_knot_stride >= 1
         and args.spline_samples >= 20
         and args.timing_samples >= 100
+        and args.toppra_gridpoints >= 3
+        and args.toppra_validation_points >= 3
+        and args.toppra_refinement_iterations >= 0
         and args.orientation_metric_weight >= 0.0
         and args.max_linear_speed > 0.0
         and args.max_angular_speed > 0.0
-        and args.duration_scale > 0.0
+        and np.all(np.asarray(args.max_linear_acceleration) > 0.0)
+        and np.all(np.asarray(args.max_angular_acceleration) > 0.0)
+        and 0.0 < args.velocity_scale <= 1.0
+        and 0.0 < args.acceleration_scale <= 1.0
+        and args.duration_scale >= 1.0
         and args.start_delay >= 0.0
         and args.goal_hold >= 0.0
         and args.control_dt > 0.0
@@ -499,10 +557,24 @@ def main() -> None:
         f"knot stride={problem.multi_plan.knot_stride_used}"
     )
     print(
-        f"Speed limits: {args.max_linear_speed:.2f} m/s, "
+        f"Retimer={args.retimer}; speed limits: "
+        f"{args.max_linear_speed:.2f} m/s, "
         f"{args.max_angular_speed:.2f} rad/s; "
         f"reference duration={problem.reference.duration:.2f} s"
     )
+    if isinstance(problem.reference, ToppraTimedReference):
+        validation = problem.reference.validation
+        print(
+            "TOPP-RA dense validation: "
+            f"{validation.gridpoint_count} solve / "
+            f"{validation.validation_point_count} check points, "
+            f"|v|max={validation.max_linear_speed:.3f} m/s, "
+            f"|omega|max={validation.max_angular_speed:.3f} rad/s, "
+            "max |a_W|="
+            f"{validation.max_abs_linear_acceleration_world.round(3)}, "
+            "max |alpha_B|="
+            f"{validation.max_abs_angular_acceleration_body.round(3)}"
+        )
     print(
         "Waypoint arrivals [s]: "
         + ", ".join(

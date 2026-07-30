@@ -5,10 +5,9 @@ collision-free segments are concatenated and interpolated by one clamped cubic
 B-spline.  Position and sign-continuous quaternion coefficients share the same
 chord-length parameterization; quaternions are normalized after evaluation.
 
-The timed reference uses the analytic spline derivatives and allocates time
-against both linear- and angular-speed limits.  A minimum-jerk time warp makes
-the vehicle start and finish at rest while passing intermediate waypoints
-without stopping.
+The spline exposes analytic first and second path derivatives so that either
+the legacy minimum-jerk retimer or the kinematic TOPP-RA retimer can preserve
+the same geometric path.
 """
 
 from __future__ import annotations
@@ -116,6 +115,26 @@ class InterpolatingSE3BSpline:
     ) -> tuple[FloatArray, FloatArray, FloatArray]:
         """Return states, ``dp/du``, and normalized ``dq/du``."""
 
+        states, position_derivative, _, quaternion_derivative, _ = (
+            self.evaluate_with_second_derivatives(parameters)
+        )
+        return states, position_derivative, quaternion_derivative
+
+    def evaluate_with_second_derivatives(
+        self, parameters: ArrayLike
+    ) -> tuple[
+        FloatArray,
+        FloatArray,
+        FloatArray,
+        FloatArray,
+        FloatArray,
+    ]:
+        """Return pose plus first/second derivatives with respect to path.
+
+        Quaternion derivatives are those of the normalized ``[w, x, y, z]``
+        quaternion curve, not of its unnormalized four-dimensional B-spline.
+        """
+
         values = np.asarray(parameters, dtype=np.float64)
         scalar_input = values.ndim == 0
         values = np.atleast_1d(values)
@@ -137,13 +156,25 @@ class InterpolatingSE3BSpline:
             self.knots,
             len(self.states),
         )
+        second_derivative_basis = _basis_second_derivative_matrix(
+            values,
+            self.degree,
+            self.knots,
+            len(self.states),
+        )
         positions = basis @ self.position_control_points
         position_derivative = (
             derivative_basis @ self.position_control_points
         )
+        position_second_derivative = (
+            second_derivative_basis @ self.position_control_points
+        )
         raw_quaternion = basis @ self.quaternion_control_points
         raw_derivative = (
             derivative_basis @ self.quaternion_control_points
+        )
+        raw_second_derivative = (
+            second_derivative_basis @ self.quaternion_control_points
         )
         raw_norm = np.linalg.norm(
             raw_quaternion, axis=1, keepdims=True
@@ -159,14 +190,39 @@ class InterpolatingSE3BSpline:
         quaternion_derivative = (
             raw_derivative - quaternions * tangent_projection
         ) / raw_norm
+        tangent_projection_derivative = np.sum(
+            quaternion_derivative * raw_derivative
+            + quaternions * raw_second_derivative,
+            axis=1,
+            keepdims=True,
+        )
+        quaternion_second_derivative = (
+            (
+                raw_second_derivative
+                - quaternions * tangent_projection_derivative
+            )
+            / raw_norm
+            - 2.0
+            * quaternion_derivative
+            * tangent_projection
+            / raw_norm
+        )
         states = np.concatenate((positions, quaternions), axis=1)
         if scalar_input:
             return (
                 states[0],
                 position_derivative[0],
+                position_second_derivative[0],
                 quaternion_derivative[0],
+                quaternion_second_derivative[0],
             )
-        return states, position_derivative, quaternion_derivative
+        return (
+            states,
+            position_derivative,
+            position_second_derivative,
+            quaternion_derivative,
+            quaternion_second_derivative,
+        )
 
 
 @dataclass(frozen=True)
@@ -683,6 +739,70 @@ def _basis_derivative_matrix(
         where=right_denominator[None, :] > 0.0,
     )
     return left - right
+
+
+def _basis_second_derivative_matrix(
+    parameters: FloatArray,
+    degree: int,
+    knots: FloatArray,
+    control_count: int,
+) -> FloatArray:
+    values = np.asarray(parameters, dtype=np.float64)
+    if degree < 2:
+        return np.zeros((len(values), control_count), dtype=np.float64)
+
+    lower_values = np.where(
+        values >= 1.0 - 1.0e-14, 1.0 - 1.0e-12, values
+    )
+    lower_basis = _basis_matrix(
+        lower_values,
+        degree - 2,
+        knots,
+        control_count + 2,
+    )
+    lower_count = control_count + 1
+    lower_left_denominator = (
+        knots[degree - 1 : degree - 1 + lower_count]
+        - knots[:lower_count]
+    )
+    lower_right_denominator = (
+        knots[degree : degree + lower_count]
+        - knots[1 : 1 + lower_count]
+    )
+    lower_derivative = np.divide(
+        (degree - 1) * lower_basis[:, :lower_count],
+        lower_left_denominator[None, :],
+        out=np.zeros((len(values), lower_count)),
+        where=lower_left_denominator[None, :] > 0.0,
+    )
+    lower_derivative -= np.divide(
+        (degree - 1) * lower_basis[:, 1 : lower_count + 1],
+        lower_right_denominator[None, :],
+        out=np.zeros((len(values), lower_count)),
+        where=lower_right_denominator[None, :] > 0.0,
+    )
+
+    left_denominator = (
+        knots[degree : degree + control_count]
+        - knots[:control_count]
+    )
+    right_denominator = (
+        knots[degree + 1 : degree + 1 + control_count]
+        - knots[1 : 1 + control_count]
+    )
+    second_derivative = np.divide(
+        degree * lower_derivative[:, :control_count],
+        left_denominator[None, :],
+        out=np.zeros((len(values), control_count)),
+        where=left_denominator[None, :] > 0.0,
+    )
+    second_derivative -= np.divide(
+        degree * lower_derivative[:, 1 : control_count + 1],
+        right_denominator[None, :],
+        out=np.zeros((len(values), control_count)),
+        where=right_denominator[None, :] > 0.0,
+    )
+    return second_derivative
 
 
 def _basis_derivatives(

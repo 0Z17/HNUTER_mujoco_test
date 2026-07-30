@@ -247,11 +247,13 @@ MPPI 状态为 `[x, y, z, vx, vy, vz]`，控制量为世界坐标系加速度
 - `ompl_se3_planner.py`：OMPL SE(3) Bi-RRT规划、碰撞检查和时间参数化
 - `hnuter_ompl_mppi_demo.py`：给定起终位姿的Bi-RRT + 6-DoF MPPI闭环demo
 - `multi_waypoint_planner.py`：多段OMPL规划、全局三次SE(3) B样条和时间分配
+- `toppra_retiming.py`：标量TOPP-RA、SE(3)运动学约束和完整轨迹采样
 - `hnuter_multi_waypoint_demo.py`：3～5个中间位姿的规划与快速MPPI跟踪demo
 - `rerun_bridge.py`：与MuJoCo/OMPL/MPPI解耦的Rerun记录与回放桥接模块
 - `compare_mppi_smoothing.py`：平滑权重和预测时域的闭环消融对比
 - `tests/test_mppi.py`：MPPI 接口、约束和闭环收敛测试
 - `tests/test_multi_waypoint_planner.py`：B样条插值、碰撞和时间分配测试
+- `tests/test_toppra_retiming.py`：二阶导数、静止边界及稠密约束复检
 
 ### 运行可视化 demo
 
@@ -545,9 +547,19 @@ site-packages加入 `PYTHONPATH`。输出文件为：
 终点，并在串接处保持位置与姿态参考连续；生成后会重新对整条稠密曲线执行
 边界和障碍物碰撞检查。
 
-时间分配同时受到最大线速度和最大角速度约束，再通过全局minimum-jerk时间
-缩放得到连续的速度参考。默认最大线速度为 `1.05 m/s`，高于单目标demo的
-`0.65 m/s`。
+时间分配默认使用标量路径参数TOPP-RA。TOPP-RA只优化
+`s(t), s_dot(t), s_ddot(t)`，不会把四元数当作普通关节，也不会改变B样条
+几何路径。自定义约束根据B样条解析一、二阶导数限制：
+
+- 世界系线速度范数，默认上限 `1.05 m/s`；
+- 机体系角速度范数，默认上限 `1.50 rad/s`；
+- 世界系逐轴线加速度，默认上限 `[4.0, 4.0, 3.5] m/s²`；
+- 机体系逐轴角加速度，默认上限 `[6.0, 6.0, 5.0] rad/s²`；
+- `s_dot(0) = s_dot(T) = 0` 的静止起点和终点。
+
+加速度约束使用TOPP-RA的插值离散方式，求解网格同时包含B样条节点；求解后
+默认用4001点独立复检。若复检失败会自动加密网格，仍失败则拒绝输出轨迹。
+默认速度和加速度安全系数分别为 `0.85` 与 `0.80`。
 
 运行MuJoCo可视化：
 
@@ -565,6 +577,42 @@ python hnuter_multi_waypoint_demo.py --headless --rerun
 
 ```bash
 python hnuter_multi_waypoint_demo.py --plan-only
+```
+
+自定义运动学限制和TOPP-RA网格：
+
+```bash
+python hnuter_multi_waypoint_demo.py --plan-only \
+  --max-linear-speed 1.05 \
+  --max-angular-speed 1.50 \
+  --max-linear-acceleration 4.0 4.0 3.5 \
+  --max-angular-acceleration 6.0 6.0 5.0 \
+  --toppra-gridpoints 401 \
+  --toppra-validation-points 4001
+```
+
+如需回归对比原有全局minimum-jerk时间缩放，可使用
+`--retimer minimum-jerk`。
+
+代码中可在保持现有MPPI接口的同时取得完整运动学轨迹：
+
+```python
+from toppra_retiming import ToppraTimedReference
+
+reference = ToppraTimedReference(
+    multi_plan,
+    max_linear_speed=1.05,
+    max_angular_speed=1.50,
+    max_linear_acceleration=(4.0, 4.0, 3.5),
+    max_angular_acceleration=(6.0, 6.0, 5.0),
+)
+
+full = reference.sample_full(sample_times)
+mppi_reference = full.reference
+
+# full.linear_acceleration_world
+# full.angular_acceleration_body
+# full.path_position / path_speed / path_acceleration
 ```
 
 可以重复提供3～5个自定义中间位姿，格式为

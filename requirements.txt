@@ -2,3 +2,4 @@ matplotlib==3.11.1
 mujoco==3.10.0
 pygame==2.6.1
 rerun-sdk==0.35.0
+toppra==0.6.9
