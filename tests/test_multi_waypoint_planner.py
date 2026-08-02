@@ -14,6 +14,7 @@ from multi_waypoint_planner import (
     BSplineTimeParameterizedReference,
     InterpolatingSE3BSpline,
     MultiWaypointOMPLPlanner,
+    WaypointConstrainedSmoothingSE3BSpline,
 )
 from ompl_se3_planner import (
     OMPLSE3Planner,
@@ -23,6 +24,73 @@ from ompl_se3_planner import (
 
 
 class MultiWaypointPlannerTest(unittest.TestCase):
+    def test_constrained_smoother_preserves_hard_waypoints_and_reduces_curvature(
+        self,
+    ) -> None:
+        parameters = np.linspace(0.0, 1.0, 41)
+        positions = np.column_stack(
+            (
+                3.0 * parameters,
+                0.22 * np.sin(2.0 * np.pi * parameters)
+                + 0.045 * np.sin(16.0 * np.pi * parameters),
+                1.0
+                + 0.15 * np.sin(np.pi * parameters)
+                + 0.03 * np.sin(14.0 * np.pi * parameters),
+            )
+        )
+        quaternions = quaternion_from_euler(
+            np.column_stack(
+                (
+                    0.12 * np.sin(2.0 * np.pi * parameters),
+                    0.10 * np.sin(3.0 * np.pi * parameters),
+                    1.20 * parameters
+                    + 0.04 * np.sin(14.0 * np.pi * parameters),
+                )
+            )
+        )
+        guide_states = np.concatenate(
+            (positions, quaternions), axis=1
+        )
+        hard_indices = (0, 20, 40)
+        interpolating = InterpolatingSE3BSpline(
+            guide_states, parameters=parameters
+        )
+        smoothed = WaypointConstrainedSmoothingSE3BSpline(
+            guide_states,
+            hard_indices,
+            parameters=parameters,
+            control_point_stride=4,
+        )
+
+        hard_states = smoothed.evaluate(
+            smoothed.waypoint_parameters
+        )
+        np.testing.assert_allclose(
+            hard_states[:, :3],
+            guide_states[list(hard_indices), :3],
+            atol=1.0e-10,
+        )
+        hard_attitude_error = np.linalg.norm(
+            quaternion_error_vector(
+                hard_states[:, 3:7],
+                guide_states[list(hard_indices), 3:7],
+            ),
+            axis=1,
+        )
+        self.assertLess(float(np.max(hard_attitude_error)), 1.0e-9)
+
+        dense_parameters = np.linspace(0.0, 1.0, 5001)
+        interpolating_curvature = _maximum_curvature(
+            interpolating, dense_parameters
+        )
+        smoothed_curvature = _maximum_curvature(
+            smoothed, dense_parameters
+        )
+        self.assertLess(
+            smoothed_curvature, 0.5 * interpolating_curvature
+        )
+        self.assertGreater(smoothed.guide_position_rms_m, 0.0)
+
     def test_cubic_spline_interpolates_all_pose_nodes(self) -> None:
         positions = np.array(
             [
@@ -99,6 +167,13 @@ class MultiWaypointPlannerTest(unittest.TestCase):
         )
         self.assertEqual(len(plan.segment_paths), 4)
         self.assertGreater(plan.minimum_clearance_m, 0.0)
+        self.assertEqual(
+            plan.spline_method, "waypoint-constrained smoothing"
+        )
+        self.assertLess(
+            plan.control_point_count, len(plan.raw_states)
+        )
+        self.assertTrue(np.isfinite(plan.maximum_curvature_per_m))
 
         waypoint_states = plan.spline.evaluate(
             plan.waypoint_parameters
@@ -136,6 +211,22 @@ class MultiWaypointPlannerTest(unittest.TestCase):
         np.testing.assert_allclose(
             states[[0, -1], 10:13], 0.0, atol=1.0e-12
         )
+
+
+def _maximum_curvature(
+    spline: InterpolatingSE3BSpline, parameters: np.ndarray
+) -> float:
+    _, first, second, _, _ = (
+        spline.evaluate_with_second_derivatives(parameters)
+    )
+    speed = np.linalg.norm(first, axis=1)
+    curvature = np.divide(
+        np.linalg.norm(np.cross(first, second), axis=1),
+        speed**3,
+        out=np.zeros_like(speed),
+        where=speed > 1.0e-9,
+    )
+    return float(np.max(curvature))
 
 
 if __name__ == "__main__":

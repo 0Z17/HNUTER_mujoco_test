@@ -1,9 +1,10 @@
-"""Multi-waypoint OMPL planning with a global interpolating SE(3) B-spline.
+"""Multi-waypoint OMPL planning with a globally smoothed SE(3) B-spline.
 
 Each consecutive waypoint pair is planned by OMPL RRTConnect.  The resulting
-collision-free segments are concatenated and interpolated by one clamped cubic
-B-spline.  Position and sign-continuous quaternion coefficients share the same
-chord-length parameterization; quaternions are normalized after evaluation.
+collision-free segments are concatenated and used as a soft guide for one
+clamped B-spline.  Mission waypoint poses remain hard equality constraints,
+while acceleration and jerk penalties suppress the sharp turns inherited from
+the sampling-based path.
 
 The spline exposes analytic first and second path derivatives so that either
 the legacy minimum-jerk retimer or the kinematic TOPP-RA retimer can preserve
@@ -64,6 +65,8 @@ class InterpolatingSE3BSpline:
         )
         _make_quaternions_continuous(self.states[:, 3:7])
         self.degree = min(int(degree), len(self.states) - 1)
+        self.control_point_count = len(self.states)
+        self.method_name = "interpolating"
         if parameters is None:
             self.parameters = _se3_chord_parameters(
                 self.states, orientation_metric_weight
@@ -89,7 +92,7 @@ class InterpolatingSE3BSpline:
             self.parameters,
             self.degree,
             self.knots,
-            len(self.states),
+            self.control_point_count,
         )
         condition_number = float(
             np.linalg.cond(interpolation_matrix)
@@ -148,19 +151,19 @@ class InterpolatingSE3BSpline:
             values,
             self.degree,
             self.knots,
-            len(self.states),
+            self.control_point_count,
         )
         derivative_basis = _basis_derivative_matrix(
             values,
             self.degree,
             self.knots,
-            len(self.states),
+            self.control_point_count,
         )
         second_derivative_basis = _basis_second_derivative_matrix(
             values,
             self.degree,
             self.knots,
-            len(self.states),
+            self.control_point_count,
         )
         positions = basis @ self.position_control_points
         position_derivative = (
@@ -225,6 +228,249 @@ class InterpolatingSE3BSpline:
         )
 
 
+class WaypointConstrainedSmoothingSE3BSpline(
+    InterpolatingSE3BSpline
+):
+    """Smooth an OMPL guide while exactly preserving mission waypoint poses.
+
+    The optimization is a linearly equality-constrained least-squares problem.
+    OMPL samples are soft observations.  Position and raw quaternion second and
+    third path derivatives are regularized; evaluated quaternions are
+    normalized exactly as in :class:`InterpolatingSE3BSpline`.
+    """
+
+    def __init__(
+        self,
+        guide_states: ArrayLike,
+        waypoint_indices: Sequence[int],
+        *,
+        parameters: ArrayLike | None = None,
+        degree: int = 5,
+        control_point_count: int | None = None,
+        control_point_stride: int = 6,
+        orientation_metric_weight: float = 0.35,
+        guide_weight: float = 1.0,
+        guide_sample_weights: ArrayLike | None = None,
+        position_acceleration_weight: float = 1.0e-8,
+        position_jerk_weight: float = 1.0e-12,
+        orientation_acceleration_weight: float = 2.5e-9,
+        orientation_jerk_weight: float = 2.5e-13,
+        regularization: float = 1.0e-10,
+    ) -> None:
+        state_array = np.asarray(guide_states, dtype=np.float64)
+        if (
+            state_array.ndim != 2
+            or state_array.shape[1] != 7
+            or len(state_array) < 2
+            or not np.all(np.isfinite(state_array))
+        ):
+            raise ValueError("guide_states must have shape (N, 7), N >= 2")
+        waypoint_index_array = np.asarray(
+            waypoint_indices, dtype=np.int64
+        )
+        if (
+            waypoint_index_array.ndim != 1
+            or len(waypoint_index_array) < 2
+            or waypoint_index_array[0] != 0
+            or waypoint_index_array[-1] != len(state_array) - 1
+            or np.any(np.diff(waypoint_index_array) <= 0)
+        ):
+            raise ValueError(
+                "waypoint_indices must be increasing and include endpoints"
+            )
+        if degree < 3 or control_point_stride < 1:
+            raise ValueError(
+                "smoothing degree must be >= 3 and stride positive"
+            )
+        weights = np.asarray(
+            [
+                guide_weight,
+                position_acceleration_weight,
+                position_jerk_weight,
+                orientation_acceleration_weight,
+                orientation_jerk_weight,
+                regularization,
+            ],
+            dtype=np.float64,
+        )
+        if not np.all(np.isfinite(weights)) or np.any(weights < 0.0):
+            raise ValueError("smoothing weights must be finite and non-negative")
+        if guide_weight <= 0.0 or regularization <= 0.0:
+            raise ValueError(
+                "guide_weight and regularization must be positive"
+            )
+        if orientation_metric_weight < 0.0:
+            raise ValueError(
+                "orientation_metric_weight must be non-negative"
+            )
+
+        self.states = state_array.copy()
+        self.states[:, 3:7] = normalize_quaternion(
+            self.states[:, 3:7]
+        )
+        _make_quaternions_continuous(self.states[:, 3:7])
+        if parameters is None:
+            self.parameters = _se3_chord_parameters(
+                self.states, orientation_metric_weight
+            )
+        else:
+            self.parameters = np.asarray(parameters, dtype=np.float64)
+            if (
+                self.parameters.shape != (len(self.states),)
+                or not np.all(np.isfinite(self.parameters))
+                or abs(float(self.parameters[0])) > 1.0e-12
+                or abs(float(self.parameters[-1] - 1.0)) > 1.0e-12
+                or np.any(np.diff(self.parameters) <= 0.0)
+            ):
+                raise ValueError(
+                    "parameters must be strictly increasing from 0 to 1"
+                )
+
+        requested_control_count = (
+            int(control_point_count)
+            if control_point_count is not None
+            else int(np.ceil(len(self.states) / control_point_stride))
+        )
+        minimum_control_count = max(
+            int(degree) + 1, len(waypoint_index_array) + int(degree) - 1
+        )
+        self.control_point_count = min(
+            len(self.states),
+            max(requested_control_count, minimum_control_count),
+        )
+        self.degree = min(
+            int(degree), self.control_point_count - 1
+        )
+        self.method_name = "waypoint-constrained smoothing"
+        self.waypoint_indices = tuple(
+            int(index) for index in waypoint_index_array
+        )
+        self.waypoint_parameters = self.parameters[
+            waypoint_index_array
+        ].copy()
+        self.knots = _open_uniform_clamped_knots(
+            self.control_point_count, self.degree
+        )
+        if guide_sample_weights is None:
+            sample_weights = np.ones(
+                len(self.states), dtype=np.float64
+            )
+        else:
+            sample_weights = np.asarray(
+                guide_sample_weights, dtype=np.float64
+            )
+            if (
+                sample_weights.shape != (len(self.states),)
+                or not np.all(np.isfinite(sample_weights))
+                or np.any(sample_weights <= 0.0)
+            ):
+                raise ValueError(
+                    "guide_sample_weights must be positive with shape (N,)"
+                )
+            sample_weights = sample_weights / float(
+                np.mean(sample_weights)
+            )
+
+        guide_basis = _basis_matrix(
+            self.parameters,
+            self.degree,
+            self.knots,
+            self.control_point_count,
+        )
+        hard_basis = guide_basis[waypoint_index_array]
+        smooth_parameters = np.linspace(
+            0.0, 1.0, max(201, 4 * self.control_point_count + 1)
+        )
+        second_derivative_basis = _basis_second_derivative_matrix(
+            smooth_parameters,
+            self.degree,
+            self.knots,
+            self.control_point_count,
+        )
+        third_derivative_basis = _basis_third_derivative_matrix(
+            smooth_parameters,
+            self.degree,
+            self.knots,
+            self.control_point_count,
+        )
+
+        self.position_control_points = (
+            _solve_equality_constrained_smoothing(
+                guide_basis,
+                self.states[:, :3],
+                hard_basis,
+                self.states[waypoint_index_array, :3],
+                second_derivative_basis,
+                third_derivative_basis,
+                guide_weight=guide_weight,
+                guide_sample_weights=sample_weights,
+                acceleration_weight=position_acceleration_weight,
+                jerk_weight=position_jerk_weight,
+                regularization=regularization,
+            )
+        )
+        self.quaternion_control_points = (
+            _solve_equality_constrained_smoothing(
+                guide_basis,
+                self.states[:, 3:7],
+                hard_basis,
+                self.states[waypoint_index_array, 3:7],
+                second_derivative_basis,
+                third_derivative_basis,
+                guide_weight=guide_weight,
+                guide_sample_weights=sample_weights,
+                acceleration_weight=orientation_acceleration_weight,
+                jerk_weight=orientation_jerk_weight,
+                regularization=regularization,
+            )
+        )
+
+        hard_states = self.evaluate(self.waypoint_parameters)
+        hard_position_error = np.linalg.norm(
+            hard_states[:, :3]
+            - self.states[waypoint_index_array, :3],
+            axis=1,
+        )
+        hard_attitude_error = np.linalg.norm(
+            _relative_rotation_vectors(
+                hard_states[:, 3:7],
+                self.states[waypoint_index_array, 3:7],
+            ),
+            axis=1,
+        )
+        if (
+            float(np.max(hard_position_error)) > 1.0e-8
+            or float(np.max(hard_attitude_error)) > 1.0e-8
+        ):
+            raise RuntimeError(
+                "constrained smoother did not preserve hard waypoints"
+            )
+
+        guide_fit = self.evaluate(self.parameters)
+        self.guide_position_rms_m = float(
+            np.sqrt(
+                np.mean(
+                    np.sum(
+                        np.square(
+                            guide_fit[:, :3] - self.states[:, :3]
+                        ),
+                        axis=1,
+                    )
+                )
+            )
+        )
+        guide_attitude_error = _relative_rotation_vectors(
+            guide_fit[:, 3:7], self.states[:, 3:7]
+        )
+        self.guide_attitude_rms_rad = float(
+            np.sqrt(
+                np.mean(
+                    np.sum(np.square(guide_attitude_error), axis=1)
+                )
+            )
+        )
+
+
 @dataclass(frozen=True)
 class MultiWaypointPlan:
     """Segment plans plus their globally stitched B-spline."""
@@ -238,6 +484,11 @@ class MultiWaypointPlan:
     waypoint_path_indices: tuple[int, ...]
     minimum_clearance_m: float
     knot_stride_used: int
+    spline_method: str
+    control_point_count: int
+    guide_position_rms_m: float
+    guide_attitude_rms_rad: float
+    maximum_curvature_per_m: float
 
     @property
     def intermediate_waypoints(self) -> tuple[SE3Pose, ...]:
@@ -260,6 +511,15 @@ class MultiWaypointOMPLPlanner:
         knot_stride: int = 3,
         spline_samples: int = 1000,
         orientation_metric_weight: float = 0.35,
+        spline_method: str = "constrained-smoothing",
+        smoothing_degree: int = 5,
+        smoothing_guide_weight: float = 1.0,
+        smoothing_position_acceleration_weight: float = 1.0e-8,
+        smoothing_position_jerk_weight: float = 1.0e-12,
+        smoothing_orientation_acceleration_weight: float = 2.5e-9,
+        smoothing_orientation_jerk_weight: float = 2.5e-13,
+        smoothing_clearance_weight_scale: float = 0.30,
+        smoothing_max_attempts: int = 4,
     ) -> MultiWaypointPlan:
         waypoint_tuple = tuple(waypoints)
         if len(waypoint_tuple) < 2:
@@ -268,6 +528,17 @@ class MultiWaypointOMPLPlanner:
             raise ValueError(
                 "knot_stride must be positive and spline_samples >= 20"
             )
+        if spline_method not in (
+            "constrained-smoothing",
+            "interpolating",
+        ):
+            raise ValueError("unsupported spline_method")
+        if (
+            smoothing_degree < 3
+            or smoothing_clearance_weight_scale < 0.0
+            or smoothing_max_attempts < 1
+        ):
+            raise ValueError("invalid constrained smoothing configuration")
 
         segments = tuple(
             self.planner.plan(
@@ -283,6 +554,66 @@ class MultiWaypointOMPLPlanner:
             )
         )
         raw_states, waypoint_indices = _concatenate_segments(segments)
+
+        if spline_method == "constrained-smoothing":
+            raw_parameters = _se3_chord_parameters(
+                raw_states, orientation_metric_weight
+            )
+            raw_clearance = self.planner.clearance(
+                raw_states[:, :3], raw_states[:, 3:7]
+            )
+            clearance_weight = 1.0 + np.square(
+                smoothing_clearance_weight_scale
+                / (np.maximum(raw_clearance, 0.0) + 0.01)
+            )
+            clearance_weight = np.minimum(clearance_weight, 400.0)
+            last_error: RuntimeError | None = None
+            for attempt in range(smoothing_max_attempts):
+                stride = max(1, knot_stride - attempt)
+                try:
+                    spline = WaypointConstrainedSmoothingSE3BSpline(
+                        raw_states,
+                        waypoint_indices,
+                        parameters=raw_parameters,
+                        degree=smoothing_degree,
+                        control_point_stride=stride,
+                        orientation_metric_weight=(
+                            orientation_metric_weight
+                        ),
+                        guide_weight=(
+                            smoothing_guide_weight * 5.0**attempt
+                        ),
+                        guide_sample_weights=clearance_weight,
+                        position_acceleration_weight=(
+                            smoothing_position_acceleration_weight
+                        ),
+                        position_jerk_weight=(
+                            smoothing_position_jerk_weight
+                        ),
+                        orientation_acceleration_weight=(
+                            smoothing_orientation_acceleration_weight
+                        ),
+                        orientation_jerk_weight=(
+                            smoothing_orientation_jerk_weight
+                        ),
+                    )
+                    return self._build_validated_plan(
+                        waypoint_tuple,
+                        segments,
+                        raw_states,
+                        waypoint_indices,
+                        spline,
+                        spline.waypoint_parameters,
+                        spline_samples,
+                        stride,
+                    )
+                except RuntimeError as error:
+                    last_error = error
+            raise RuntimeError(
+                "waypoint-constrained smoothing failed collision or "
+                f"workspace validation after {smoothing_max_attempts} "
+                f"attempts: {last_error}"
+            )
 
         last_error: RuntimeError | None = None
         for stride in range(knot_stride, 0, -1):
@@ -340,7 +671,9 @@ class MultiWaypointOMPLPlanner:
     ) -> MultiWaypointPlan:
         parameters = np.linspace(0.0, 1.0, spline_samples)
         spline_states = spline.evaluate(parameters)
-        clearance = self.planner.clearance(spline_states[:, :3])
+        clearance = self.planner.clearance(
+            spline_states[:, :3], spline_states[:, 3:7]
+        )
         in_bounds = np.all(
             (spline_states[:, :3] >= self.planner.bounds_min)
             & (spline_states[:, :3] <= self.planner.bounds_max),
@@ -375,12 +708,34 @@ class MultiWaypointOMPLPlanner:
             or float(np.max(attitude_error)) > 1.0e-7
         ):
             raise RuntimeError(
-                "interpolating B-spline did not pass waypoint poses"
+                "SE(3) B-spline did not pass hard waypoint poses"
             )
 
         translation_delta = np.diff(spline_states[:, :3], axis=0)
         rotation_delta = _relative_rotation_vectors(
             spline_states[:-1, 3:7], spline_states[1:, 3:7]
+        )
+        (
+            _,
+            position_path_derivative,
+            position_path_second_derivative,
+            _,
+            _,
+        ) = spline.evaluate_with_second_derivatives(parameters)
+        derivative_norm = np.linalg.norm(
+            position_path_derivative, axis=1
+        )
+        curvature = np.divide(
+            np.linalg.norm(
+                np.cross(
+                    position_path_derivative,
+                    position_path_second_derivative,
+                ),
+                axis=1,
+            ),
+            derivative_norm**3,
+            out=np.zeros_like(derivative_norm),
+            where=derivative_norm > 1.0e-9,
         )
         spline_path = PlannedSE3Path(
             states=spline_states,
@@ -397,8 +752,8 @@ class MultiWaypointOMPLPlanner:
                 np.sum(np.linalg.norm(rotation_delta, axis=1))
             ),
             planner_name=(
-                f"OMPL RRTConnect x{len(segments)} + global cubic "
-                "SE(3) B-spline"
+                f"OMPL RRTConnect x{len(segments)} + global degree-"
+                f"{spline.degree} {spline.method_name} SE(3) B-spline"
             ),
         )
         path_indices = tuple(
@@ -415,6 +770,15 @@ class MultiWaypointOMPLPlanner:
             waypoint_path_indices=path_indices,
             minimum_clearance_m=float(np.min(clearance)),
             knot_stride_used=stride,
+            spline_method=spline.method_name,
+            control_point_count=spline.control_point_count,
+            guide_position_rms_m=float(
+                getattr(spline, "guide_position_rms_m", np.nan)
+            ),
+            guide_attitude_rms_rad=float(
+                getattr(spline, "guide_attitude_rms_rad", np.nan)
+            ),
+            maximum_curvature_per_m=float(np.max(curvature)),
         )
 
 
@@ -629,6 +993,102 @@ def _averaged_clamped_knots(
     return knots
 
 
+def _open_uniform_clamped_knots(
+    control_count: int, degree: int
+) -> FloatArray:
+    if control_count <= degree:
+        raise ValueError("control_count must exceed degree")
+    knots = np.zeros(control_count + degree + 1, dtype=np.float64)
+    knots[-(degree + 1) :] = 1.0
+    interior_count = control_count - degree - 1
+    if interior_count > 0:
+        knots[degree + 1 : -(degree + 1)] = np.linspace(
+            0.0, 1.0, interior_count + 2
+        )[1:-1]
+    return knots
+
+
+def _solve_equality_constrained_smoothing(
+    guide_basis: FloatArray,
+    guide_values: FloatArray,
+    hard_basis: FloatArray,
+    hard_values: FloatArray,
+    second_derivative_basis: FloatArray,
+    third_derivative_basis: FloatArray,
+    *,
+    guide_weight: float,
+    guide_sample_weights: FloatArray,
+    acceleration_weight: float,
+    jerk_weight: float,
+    regularization: float,
+) -> FloatArray:
+    control_count = guide_basis.shape[1]
+    output_dimension = guide_values.shape[1]
+    guide_scale = np.sqrt(
+        guide_weight * guide_sample_weights / len(guide_basis)
+    )
+    rows = [guide_scale[:, None] * guide_basis]
+    targets = [guide_scale[:, None] * guide_values]
+    if acceleration_weight > 0.0:
+        scale = np.sqrt(
+            acceleration_weight / len(second_derivative_basis)
+        )
+        rows.append(scale * second_derivative_basis)
+        targets.append(
+            np.zeros(
+                (len(second_derivative_basis), output_dimension),
+                dtype=np.float64,
+            )
+        )
+    if jerk_weight > 0.0:
+        scale = np.sqrt(jerk_weight / len(third_derivative_basis))
+        rows.append(scale * third_derivative_basis)
+        targets.append(
+            np.zeros(
+                (len(third_derivative_basis), output_dimension),
+                dtype=np.float64,
+            )
+        )
+    rows.append(np.sqrt(regularization) * np.eye(control_count))
+    targets.append(
+        np.zeros((control_count, output_dimension), dtype=np.float64)
+    )
+    design = np.vstack(rows)
+    target = np.vstack(targets)
+    hessian = design.T @ design
+    gradient = design.T @ target
+    constraint_count = len(hard_basis)
+    kkt = np.block(
+        [
+            [
+                hessian,
+                hard_basis.T,
+            ],
+            [
+                hard_basis,
+                np.zeros(
+                    (constraint_count, constraint_count),
+                    dtype=np.float64,
+                ),
+            ],
+        ]
+    )
+    right_hand_side = np.vstack((gradient, hard_values))
+    try:
+        solution = np.linalg.solve(kkt, right_hand_side)
+    except np.linalg.LinAlgError as error:
+        raise RuntimeError(
+            "waypoint-constrained B-spline solve was singular"
+        ) from error
+    control_points = solution[:control_count]
+    equality_error = hard_basis @ control_points - hard_values
+    if float(np.max(np.abs(equality_error))) > 1.0e-8:
+        raise RuntimeError(
+            "waypoint-constrained B-spline equality solve was inaccurate"
+        )
+    return control_points
+
+
 def _basis_values(
     parameter: float,
     degree: int,
@@ -803,6 +1263,47 @@ def _basis_second_derivative_matrix(
         where=right_denominator[None, :] > 0.0,
     )
     return second_derivative
+
+
+def _basis_third_derivative_matrix(
+    parameters: FloatArray,
+    degree: int,
+    knots: FloatArray,
+    control_count: int,
+) -> FloatArray:
+    values = np.asarray(parameters, dtype=np.float64)
+    if degree < 3:
+        return np.zeros((len(values), control_count), dtype=np.float64)
+    lower_values = np.where(
+        values >= 1.0 - 1.0e-14, 1.0 - 1.0e-12, values
+    )
+    lower_second_derivative = _basis_second_derivative_matrix(
+        lower_values,
+        degree - 1,
+        knots,
+        control_count + 1,
+    )
+    left_denominator = (
+        knots[degree : degree + control_count]
+        - knots[:control_count]
+    )
+    right_denominator = (
+        knots[degree + 1 : degree + 1 + control_count]
+        - knots[1 : 1 + control_count]
+    )
+    third_derivative = np.divide(
+        degree * lower_second_derivative[:, :control_count],
+        left_denominator[None, :],
+        out=np.zeros((len(values), control_count)),
+        where=left_denominator[None, :] > 0.0,
+    )
+    third_derivative -= np.divide(
+        degree * lower_second_derivative[:, 1 : control_count + 1],
+        right_denominator[None, :],
+        out=np.zeros((len(values), control_count)),
+        where=right_denominator[None, :] > 0.0,
+    )
+    return third_derivative
 
 
 def _basis_derivatives(

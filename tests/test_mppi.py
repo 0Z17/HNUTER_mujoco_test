@@ -11,6 +11,7 @@ from mppi import (
     MPPIController,
     PointMassDynamics,
     QuadraticTrackingCost,
+    ResidualMPPIController,
 )
 
 
@@ -85,6 +86,58 @@ class MPPITest(unittest.TestCase):
         invalid_config = MPPIConfig(control_smoothing=1.0)
         with self.assertRaises(ValueError):
             MPPIController(self.dynamics, self.cost, invalid_config)
+
+    def test_residual_controller_optimizes_around_feedforward(
+        self,
+    ) -> None:
+        controller = ResidualMPPIController(
+            self.dynamics, self.cost, self.config
+        )
+        state = np.zeros(6)
+        reference = np.zeros((self.config.horizon + 1, 6))
+        feedforward = np.full(
+            (self.config.horizon, 3), (0.4, -0.2, 0.1)
+        )
+
+        result = controller.command(
+            state, reference, feedforward
+        )
+
+        self.assertEqual(result.action.shape, (3,))
+        self.assertEqual(
+            result.nominal_controls.shape,
+            feedforward.shape,
+        )
+        self.assertEqual(
+            controller.nominal_residuals.shape,
+            feedforward.shape,
+        )
+        self.assertTrue(np.all(np.isfinite(result.action)))
+        self.assertTrue(
+            np.all(
+                result.nominal_controls
+                >= np.asarray(self.config.control_min)
+            )
+        )
+        self.assertTrue(
+            np.all(
+                result.nominal_controls
+                <= np.asarray(self.config.control_max)
+            )
+        )
+
+    def test_residual_controller_rejects_bad_feedforward_shape(
+        self,
+    ) -> None:
+        controller = ResidualMPPIController(
+            self.dynamics, self.cost, self.config
+        )
+        with self.assertRaises(ValueError):
+            controller.command(
+                np.zeros(6),
+                np.zeros((self.config.horizon + 1, 6)),
+                np.zeros((self.config.horizon + 1, 3)),
+            )
 
 
 if __name__ == "__main__":

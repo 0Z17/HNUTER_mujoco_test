@@ -7,7 +7,10 @@ import unittest
 import numpy as np
 
 from mppi.quaternion import quaternion_from_euler
-from multi_waypoint_planner import InterpolatingSE3BSpline
+from multi_waypoint_planner import (
+    InterpolatingSE3BSpline,
+    WaypointConstrainedSmoothingSE3BSpline,
+)
 from toppra_retiming import (
     SE3PathKinematics,
     ToppraTimedReference,
@@ -93,8 +96,13 @@ class ToppraRetimingTest(unittest.TestCase):
         max_angular_speed = 1.2
         max_linear_acceleration = np.asarray([2.0, 2.2, 1.8])
         max_angular_acceleration = np.asarray([3.0, 3.5, 2.8])
+        smoothed_spline = WaypointConstrainedSmoothingSE3BSpline(
+            self.spline.states,
+            (0, 2, 4),
+            control_point_stride=2,
+        )
         reference = ToppraTimedReference(
-            self.spline,
+            smoothed_spline,
             max_linear_speed=max_linear_speed,
             max_angular_speed=max_angular_speed,
             max_linear_acceleration=max_linear_acceleration,
@@ -178,7 +186,7 @@ class ToppraRetimingTest(unittest.TestCase):
             )
         )
 
-        geometric_pose = self.spline.evaluate(
+        geometric_pose = smoothed_spline.evaluate(
             trajectory.path_position
         )
         np.testing.assert_allclose(

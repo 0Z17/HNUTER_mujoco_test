@@ -1,0 +1,109 @@
+# cuRobo collision-sphere model generated from the primitive collisions in
+# HDJQR-0102-0055.SLDASM.urdf. All centers and radii are in metres and are
+# expressed in the base_link frame.
+#
+# Recommended robot configuration fields:
+#   collision_link_names: ["base_link"]
+#   collision_spheres: "/home/z017/research/MuJoCo-for-HNUTER/etc/URDF-for-gazebo/config/HDJQR-0102-0055.SLDASM_curobo_spheres.yml"
+#   collision_sphere_buffer: 0.0
+
+robot: "HDJQR-0102-0055.SLDASM"
+urdf_path: "../urdf/HDJQR-0102-0055.SLDASM.urdf"
+
+collision_spheres:
+  base_link:
+    # base_collision: box, 3 x 2 x 2 conservative sphere grid
+    - "center": [-0.162177, -0.059880, -0.091330]
+      "radius": 0.116982
+    - "center": [-0.162177, -0.059880, 0.023090]
+      "radius": 0.116982
+    - "center": [-0.162177, 0.059720, -0.091330]
+      "radius": 0.116982
+    - "center": [-0.162177, 0.059720, 0.023090]
+      "radius": 0.116982
+    - "center": [0.003180, -0.059880, -0.091330]
+      "radius": 0.116982
+    - "center": [0.003180, -0.059880, 0.023090]
+      "radius": 0.116982
+    - "center": [0.003180, 0.059720, -0.091330]
+      "radius": 0.116982
+    - "center": [0.003180, 0.059720, 0.023090]
+      "radius": 0.116982
+    - "center": [0.168537, -0.059880, -0.091330]
+      "radius": 0.116982
+    - "center": [0.168537, -0.059880, 0.023090]
+      "radius": 0.116982
+    - "center": [0.168537, 0.059720, -0.091330]
+      "radius": 0.116982
+    - "center": [0.168537, 0.059720, 0.023090]
+      "radius": 0.116982
+
+    # l_leg_collision: cylinder, 7 spheres along its local axis
+    - "center": [0.140869, 0.216609, -0.287840]
+      "radius": 0.027802
+    - "center": [0.132563, 0.204606, -0.256944]
+      "radius": 0.027802
+    - "center": [0.124256, 0.192603, -0.226047]
+      "radius": 0.027802
+    - "center": [0.115950, 0.180600, -0.195150]
+      "radius": 0.027802
+    - "center": [0.107644, 0.168597, -0.164253]
+      "radius": 0.027802
+    - "center": [0.099337, 0.156594, -0.133356]
+      "radius": 0.027802
+    - "center": [0.091031, 0.144591, -0.102460]
+      "radius": 0.027802
+
+    # r_leg_collision: cylinder, 7 spheres along its local axis
+    - "center": [0.140201, -0.217177, -0.287844]
+      "radius": 0.027802
+    - "center": [0.132057, -0.205075, -0.256943]
+      "radius": 0.027802
+    - "center": [0.123914, -0.192972, -0.226041]
+      "radius": 0.027802
+    - "center": [0.115770, -0.180870, -0.195140]
+      "radius": 0.027802
+    - "center": [0.107626, -0.168768, -0.164239]
+      "radius": 0.027802
+    - "center": [0.099483, -0.156665, -0.133337]
+      "radius": 0.027802
+    - "center": [0.091339, -0.144563, -0.102436]
+      "radius": 0.027802
+
+    # tail_leg_collision: cylinder, 7 spheres along its local axis
+    - "center": [-0.389541, -0.000080, -0.287977]
+      "radius": 0.027802
+    - "center": [-0.374984, -0.000080, -0.257061]
+      "radius": 0.027802
+    - "center": [-0.360427, -0.000080, -0.226146]
+      "radius": 0.027802
+    - "center": [-0.345870, -0.000080, -0.195230]
+      "radius": 0.027802
+    - "center": [-0.331313, -0.000080, -0.164314]
+      "radius": 0.027802
+    - "center": [-0.316756, -0.000080, -0.133399]
+      "radius": 0.027802
+    - "center": [-0.302199, -0.000080, -0.102483]
+      "radius": 0.027802
+
+    # The two primitive spheres map exactly to one cuRobo sphere each.
+    - "center": [0.003430, 0.408270, -0.005720]
+      "radius": 0.239200
+    - "center": [0.003430, -0.408270, -0.005720]
+      "radius": 0.239200
+
+    # tail_rotoer_collision: thin cylinder, one centre plus a six-sphere ring
+    - "center": [-0.768000, 0.000000, 0.003400]
+      "radius": 0.126901
+    - "center": [-0.668000, 0.000000, 0.003400]
+      "radius": 0.126901
+    - "center": [-0.718000, 0.086603, 0.003400]
+      "radius": 0.126901
+    - "center": [-0.818000, 0.086603, 0.003400]
+      "radius": 0.126901
+    - "center": [-0.868000, 0.000000, 0.003400]
+      "radius": 0.126901
+    - "center": [-0.818000, -0.086603, 0.003400]
+      "radius": 0.126901
+    - "center": [-0.718000, -0.086603, 0.003400]
+      "radius": 0.126901

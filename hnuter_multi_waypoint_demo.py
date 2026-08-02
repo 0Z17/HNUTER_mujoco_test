@@ -106,6 +106,25 @@ def create_multi_waypoint_problem(
         knot_stride=args.spline_knot_stride,
         spline_samples=args.spline_samples,
         orientation_metric_weight=args.orientation_metric_weight,
+        spline_method=args.spline_method,
+        smoothing_degree=args.smoothing_degree,
+        smoothing_guide_weight=args.smoothing_guide_weight,
+        smoothing_position_acceleration_weight=(
+            args.smoothing_position_acceleration_weight
+        ),
+        smoothing_position_jerk_weight=(
+            args.smoothing_position_jerk_weight
+        ),
+        smoothing_orientation_acceleration_weight=(
+            args.smoothing_orientation_acceleration_weight
+        ),
+        smoothing_orientation_jerk_weight=(
+            args.smoothing_orientation_jerk_weight
+        ),
+        smoothing_clearance_weight_scale=(
+            args.smoothing_clearance_weight_scale
+        ),
+        smoothing_max_attempts=args.smoothing_max_attempts,
     )
     if args.retimer == "toppra":
         reference = ToppraTimedReference(
@@ -210,7 +229,33 @@ def save_multi_waypoint_plan(
         quaternion_to_euler(spline_states[:, 3:7])
     )
     parameters = np.linspace(0.0, 1.0, len(spline_states))
-    clearance = problem.planner.clearance(spline_states[:, :3])
+    clearance = problem.planner.clearance(
+        spline_states[:, :3], spline_states[:, 3:7]
+    )
+    (
+        _,
+        position_path_derivative,
+        position_path_second_derivative,
+        _,
+        _,
+    ) = problem.multi_plan.spline.evaluate_with_second_derivatives(
+        parameters
+    )
+    derivative_norm = np.linalg.norm(
+        position_path_derivative, axis=1
+    )
+    curvature = np.divide(
+        np.linalg.norm(
+            np.cross(
+                position_path_derivative,
+                position_path_second_derivative,
+            ),
+            axis=1,
+        ),
+        derivative_norm**3,
+        out=np.zeros_like(derivative_norm),
+        where=derivative_norm > 1.0e-9,
+    )
     with spline_file.open("w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
         writer.writerow(
@@ -228,6 +273,7 @@ def save_multi_waypoint_plan(
                 "pitch_deg",
                 "yaw_deg",
                 "inflated_obstacle_clearance_m",
+                "path_curvature_1_per_m",
             ]
         )
         for index, state in enumerate(spline_states):
@@ -238,6 +284,7 @@ def save_multi_waypoint_plan(
                     *state,
                     *spline_euler[index],
                     clearance[index],
+                    curvature[index],
                 ]
             )
     return waypoint_file, spline_file
@@ -390,6 +437,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--segment-states", type=int, default=45)
     parser.add_argument("--spline-knot-stride", type=int, default=4)
     parser.add_argument("--spline-samples", type=int, default=1200)
+    parser.add_argument(
+        "--spline-method",
+        choices=("constrained-smoothing", "interpolating"),
+        default="constrained-smoothing",
+    )
+    parser.add_argument("--smoothing-degree", type=int, default=5)
+    parser.add_argument(
+        "--smoothing-guide-weight", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--smoothing-position-acceleration-weight",
+        type=float,
+        default=1.0e-8,
+    )
+    parser.add_argument(
+        "--smoothing-position-jerk-weight",
+        type=float,
+        default=1.0e-12,
+    )
+    parser.add_argument(
+        "--smoothing-orientation-acceleration-weight",
+        type=float,
+        default=2.5e-9,
+    )
+    parser.add_argument(
+        "--smoothing-orientation-jerk-weight",
+        type=float,
+        default=2.5e-13,
+    )
+    parser.add_argument(
+        "--smoothing-clearance-weight-scale",
+        type=float,
+        default=0.30,
+    )
+    parser.add_argument(
+        "--smoothing-max-attempts", type=int, default=4
+    )
     parser.add_argument("--timing-samples", type=int, default=4000)
     parser.add_argument(
         "--retimer",
@@ -464,6 +548,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--control-smoothing", type=float, default=0.12)
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument(
+        "--controller",
+        choices=("mppi", "residual-mppi", "geometric"),
+        default="mppi",
+        help=(
+            "outer-loop acceleration source: absolute MPPI, residual MPPI "
+            "around TOPP-RA feedforward, or direct feedforward"
+        ),
+    )
+    parser.add_argument(
+        "--ablation",
+        action="store_true",
+        help=(
+            "run geometric, MPPI, and residual MPPI controllers against "
+            "the exact same planned trajectory and save a comparison"
+        ),
+    )
+    parser.add_argument(
+        "--ablation-final-position-tolerance",
+        type=float,
+        default=0.25,
+        metavar="METRES",
+    )
+    parser.add_argument(
+        "--ablation-final-attitude-tolerance",
+        type=float,
+        default=10.0,
+        metavar="DEGREES",
+    )
     parser.add_argument("--visualized-samples", type=int, default=24)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--rerun", action="store_true")
@@ -497,6 +610,14 @@ def parse_args() -> argparse.Namespace:
         and args.segment_states >= 4
         and args.spline_knot_stride >= 1
         and args.spline_samples >= 20
+        and args.smoothing_degree >= 3
+        and args.smoothing_guide_weight > 0.0
+        and args.smoothing_position_acceleration_weight >= 0.0
+        and args.smoothing_position_jerk_weight >= 0.0
+        and args.smoothing_orientation_acceleration_weight >= 0.0
+        and args.smoothing_orientation_jerk_weight >= 0.0
+        and args.smoothing_clearance_weight_scale >= 0.0
+        and args.smoothing_max_attempts >= 1
         and args.timing_samples >= 100
         and args.toppra_gridpoints >= 3
         and args.toppra_validation_points >= 3
@@ -521,6 +642,8 @@ def parse_args() -> argparse.Namespace:
         and args.attitude_lookahead_steps >= 1
         and args.action_continuity_weight >= 0.0
         and 0.0 <= args.control_smoothing < 1.0
+        and args.ablation_final_position_tolerance > 0.0
+        and args.ablation_final_attitude_tolerance > 0.0
         and args.visualized_samples >= 1
         and args.rerun_samples >= 0
         and args.rerun_trace_stride >= 1
@@ -531,6 +654,15 @@ def parse_args() -> argparse.Namespace:
         parser.error("invalid planning, B-spline, timing, or MPPI parameter")
     if args.no_obstacles and args.obstacle:
         parser.error("--no-obstacles cannot be combined with --obstacle")
+    if args.ablation and args.plan_only:
+        parser.error("--ablation cannot be combined with --plan-only")
+    if args.ablation and (
+        args.rerun or args.rerun_path is not None or args.rerun_viewer
+    ):
+        parser.error(
+            "--ablation cannot be combined with Rerun recording; run each "
+            "--controller separately when recordings are needed"
+        )
     if (
         args.rerun_path is not None
         and args.rerun_path.suffix.lower() != ".rrd"
@@ -551,11 +683,23 @@ def main() -> None:
         f"{len(problem.multi_plan.segment_paths)} RRTConnect segments"
     )
     print(
-        f"Global cubic B-spline: {problem.path.path_length_m:.2f} m, "
+        f"Global degree-{problem.multi_plan.spline.degree} "
+        f"{problem.multi_plan.spline_method} B-spline: "
+        f"{problem.path.path_length_m:.2f} m, "
         f"{np.degrees(problem.path.rotation_length_rad):.1f} deg, "
         f"clearance={problem.multi_plan.minimum_clearance_m:.4f} m, "
-        f"knot stride={problem.multi_plan.knot_stride_used}"
+        f"control points={problem.multi_plan.control_point_count}, "
+        f"stride={problem.multi_plan.knot_stride_used}, "
+        f"max curvature="
+        f"{problem.multi_plan.maximum_curvature_per_m:.1f} 1/m"
     )
+    if np.isfinite(problem.multi_plan.guide_position_rms_m):
+        print(
+            "Soft-guide RMS: "
+            f"{problem.multi_plan.guide_position_rms_m:.3f} m, "
+            f"{np.degrees(problem.multi_plan.guide_attitude_rms_rad):.2f} "
+            "deg; mission waypoint poses remain hard constraints"
+        )
     print(
         f"Retimer={args.retimer}; speed limits: "
         f"{args.max_linear_speed:.2f} m/s, "
@@ -592,6 +736,19 @@ def main() -> None:
         print(f"B-spline: {spline_file}")
         return
 
+    if args.ablation:
+        from compare_multi_waypoint_controllers import (
+            run_controller_ablation,
+        )
+
+        csv_file, json_file, figure_file = run_controller_ablation(
+            args, problem, args.output_dir.resolve() / "ablation"
+        )
+        print(f"Ablation CSV: {csv_file}")
+        print(f"Ablation JSON: {json_file}")
+        print(f"Ablation plot: {figure_file}")
+        return
+
     run = run_demo(args, problem)
     _, log_file, plot_file, metrics_file = save_results(
         run, args.output_dir.resolve()
@@ -601,7 +758,8 @@ def main() -> None:
         waypoint_tracking_errors(run, problem)
     )
     print(
-        f"Done: RMSE={metrics.position_rmse_m:.3f} m / "
+        f"Done ({args.controller}): "
+        f"RMSE={metrics.position_rmse_m:.3f} m / "
         f"{metrics.attitude_rmse_deg:.2f} deg; "
         f"max intermediate waypoint error="
         f"{float(np.max(waypoint_position_error[1:-1])):.3f} m / "

@@ -246,13 +246,13 @@ MPPI 状态为 `[x, y, z, vx, vy, vz]`，控制量为世界坐标系加速度
 - `hnuter_mppi_pose_demo.py`：位置和姿态同时变化的全驱动6-DoF MPPI
 - `ompl_se3_planner.py`：OMPL SE(3) Bi-RRT规划、碰撞检查和时间参数化
 - `hnuter_ompl_mppi_demo.py`：给定起终位姿的Bi-RRT + 6-DoF MPPI闭环demo
-- `multi_waypoint_planner.py`：多段OMPL规划、全局三次SE(3) B样条和时间分配
+- `multi_waypoint_planner.py`：多段OMPL规划、硬waypoint/软引导SE(3)平滑
 - `toppra_retiming.py`：标量TOPP-RA、SE(3)运动学约束和完整轨迹采样
 - `hnuter_multi_waypoint_demo.py`：3～5个中间位姿的规划与快速MPPI跟踪demo
 - `rerun_bridge.py`：与MuJoCo/OMPL/MPPI解耦的Rerun记录与回放桥接模块
 - `compare_mppi_smoothing.py`：平滑权重和预测时域的闭环消融对比
 - `tests/test_mppi.py`：MPPI 接口、约束和闭环收敛测试
-- `tests/test_multi_waypoint_planner.py`：B样条插值、碰撞和时间分配测试
+- `tests/test_multi_waypoint_planner.py`：硬waypoint、曲率、碰撞和时间分配测试
 - `tests/test_toppra_retiming.py`：二阶导数、静止边界及稠密约束复检
 
 ### 运行可视化 demo
@@ -543,9 +543,14 @@ site-packages加入 `PYTHONPATH`。输出文件为：
 
 这个demo默认包含4个中间位姿（共6个位姿、5段RRTConnect），每个中间点
 具有不同的roll、pitch和yaw。每对相邻位姿先独立进行OMPL SE(3)规划，再用
-一条全局三次插值B样条串接全部路径段。B样条严格经过起点、所有中间位姿和
-终点，并在串接处保持位置与姿态参考连续；生成后会重新对整条稠密曲线执行
-边界和障碍物碰撞检查。
+一条全局五次约束平滑B样条串接全部路径段。
+
+平滑器把任务起点、中间waypoint和终点的完整位姿作为硬等式约束，因此曲线
+仍会精确经过所有任务位姿。普通OMPL采样点只作为软引导，不再被逐点精确
+插值；优化同时惩罚位置/四元数曲线的二、三阶路径导数。靠近障碍物的OMPL
+引导点会根据净空获得更高权重，以减少平滑曲线穿出安全走廊的风险。生成后
+仍会对完整稠密曲线执行边界、碰撞和waypoint误差复检，失败时自动增加控制点
+并加强引导约束。
 
 时间分配默认使用标量路径参数TOPP-RA。TOPP-RA只优化
 `s(t), s_dot(t), s_ddot(t)`，不会把四元数当作普通关节，也不会改变B样条
@@ -578,6 +583,25 @@ python hnuter_multi_waypoint_demo.py --headless --rerun
 ```bash
 python hnuter_multi_waypoint_demo.py --plan-only
 ```
+
+平滑器主要参数：
+
+```bash
+python hnuter_multi_waypoint_demo.py --plan-only \
+  --spline-method constrained-smoothing \
+  --spline-knot-stride 4 \
+  --smoothing-degree 5 \
+  --smoothing-guide-weight 1.0 \
+  --smoothing-position-acceleration-weight 1e-8 \
+  --smoothing-position-jerk-weight 1e-12 \
+  --smoothing-clearance-weight-scale 0.30
+```
+
+- 增大 `spline-knot-stride` 会减少控制点，通常更平滑但更容易偏离安全走廊；
+- 增大二、三阶导数权重会加强平滑，但可能降低净空；
+- 增大 `smoothing-guide-weight` 会更贴近OMPL路径，但会保留更多局部弯折；
+- 增大 `smoothing-clearance-weight-scale` 会更强地锚定低净空路径段；
+- `--spline-method interpolating` 可回归对比原来的逐点插值路径。
 
 自定义运动学限制和TOPP-RA网格：
 
@@ -631,10 +655,66 @@ waypoint均显示橙色半透明机器人可视mesh和RGB姿态坐标架，起�
 虚影或Rerun静态场景。输出位于 `results/multi_waypoint/`：
 
 - `multi_waypoints.csv`：全部位姿和分配后的到达时间；
-- `multi_waypoint_bspline_path.csv`：完整SE(3) B样条及逐点净空；
+- `multi_waypoint_bspline_path.csv`：完整SE(3) B样条、逐点净空和曲率；
 - `ompl_mppi_log.csv`、`ompl_mppi_results.png` 和
   `ompl_mppi_metrics.json`：闭环跟踪记录、图表和误差指标；
 - `ompl_mppi_recording.rrd`：可拖动 `sim_time` 回放的Rerun记录。
+
+#### 几何控制器 / MPPI / residual MPPI消融
+
+下面的命令在同一个进程内只规划和时间分配一次，然后从完全相同的初始状态
+分别运行三种控制方式：
+
+```bash
+python hnuter_multi_waypoint_demo.py \
+  --ablation --headless --no-realtime
+```
+
+- `geometric`：底层几何控制器直接接收TOPP-RA轨迹的位姿、速度及解析加速度；
+- `mppi`：位姿和速度参考不变，但用MPPI优化得到的6维加速度替代解析加速度。
+- `residual-mppi`：使用
+  `u = u_TOPPRA_feedforward + delta_u_MPPI`，仅滚动优化和热启动修正量。
+
+因此这个对比只消融MPPI外环，不改变OMPL路径、全局B样条、TOPP-RA时标或
+底层控制器。也可以通过 `--controller geometric`、`--controller mppi`
+或 `--controller residual-mppi` 单独运行其中一组。
+
+默认任务、默认参数和seed=13的一次完整运行结果如下（任务成功要求终点位置
+误差不超过0.25 m、姿态误差不超过10 deg且不侵入膨胀安全边界）：
+
+| 指标 | 几何控制 | MPPI | residual MPPI |
+|---|---:|---:|---:|
+| 位置RMSE | 0.0410 m | 0.0599 m | 0.0600 m |
+| 姿态RMSE | 1.846 deg | 1.732 deg | 1.833 deg |
+| 最大中间waypoint位置误差 | 0.0712 m | 0.1117 m | 0.1148 m |
+| 最小膨胀障碍物净空 | -0.0298 m | 0.0307 m | 0.0395 m |
+| 线加速度命令jerk RMS | 8.77 | 11.72 | 13.37 |
+| 角加速度命令jerk RMS | 6.24 | 13.97 | 15.12 |
+| 平均外环更新时间 | 0.689 ms | 27.88 ms | 28.04 ms |
+| 任务成功 | 否（侵入安全边界） | 是 | 是 |
+
+这组参数下，MPPI的核心收益是把侵入膨胀障碍物边界的轨迹推回安全侧，并
+略微改善姿态跟踪；它没有改善位置跟踪或控制平滑度。相反，位置RMSE、
+waypoint误差以及线/角加速度命令jerk均变大。因此当前MPPI配置体现的是
+“用跟踪精度和计算量换避障裕度”，而不是所有指标上的普遍提升。
+
+在完全相同的MPPI采样、代价权重和随机seed下，residual MPPI相对普通MPPI
+的位置RMSE基本不变，净空增加约8.8 mm；姿态RMSE和命令jerk更差。这说明
+解析前馈改变了采样中心和重要性采样变量，但当前障碍物软代价仍主导最优解，
+两种MPPI都会主动偏离贴边参考轨迹。若要进一步发挥residual结构，应继续
+调小残差采样方差、直接惩罚 `delta_u`/残差变化率，并采用自适应temperature
+改善低ESS。
+
+相对TOPP-RA前馈，普通MPPI的线/角加速度修正量RMS为
+`1.381 m/s² / 0.941 rad/s²`，residual MPPI降至
+`1.170 m/s² / 0.777 rad/s²`。residual结构确实让修正幅度更小，但在当前
+噪声尺度和仅一次迭代下，修正的时间变化更快，所以最终jerk反而更大。
+
+详细结果位于 `results/multi_waypoint/ablation/`：
+
+- `controller_ablation_summary.csv/json`：逐项指标及MPPI相对变化；
+- `controller_ablation_comparison.png`：三条实际轨迹和误差时序；
+- `geometric/`、`mppi/`、`residual-mppi/`：三组独立日志、指标和综合图。
 
 ### Rerun数据记录与回放
 
@@ -711,9 +791,82 @@ with RerunSimulationRecorder(
     )
 ```
 
-当前碰撞模型使用无人机包围球与球形障碍物，适合展示全局规划和跟踪接口。
-接入真实环境时，可在 `OMPLSE3Planner` 的状态有效性检查中替换为网格/FCL或
-MuJoCo距离查询；MPPI与时间参数化接口无需变化。
+### 基于COAL的URDF复合碰撞检测
+
+`OMPLSE3Planner` 现在支持姿态感知的 `SE3CollisionChecker`。默认示例仍可使用
+原有“无人机包围球 + 球形障碍物”模式；实际规划可以改用 `coal_collision.py`
+加载下面这个URDF：
+
+```text
+etc/URDF-for-gazebo/urdf/HDJQR-0102-0055.SLDASM.urdf
+```
+
+该文件在 `base_link` 上有7个活动碰撞体：1个机身box、3个起落架/尾桨
+cylinder、2个旋翼sphere和1个尾桨cylinder。它们的几何对象、URDF局部位姿及
+COAL几何对查询只在初始化时创建一次。OMPL采样一个状态后只执行：
+
+```text
+T_world_collision = T_world_base_link(SE3 sample) * T_base_link_collision
+```
+
+不需要关节正运动学，也不会根据倾转关节更新碰撞体，符合这些碰撞几何全部
+固结在 `base_link` 上的建模假设。如果以后在其他link上启用活动
+`<collision>`，加载器默认会直接报错，避免把可动碰撞体误当成刚体。
+
+COAL官方Python绑定可通过conda-forge安装（COAL 3.x模块名为 `coal`，代码也
+兼容旧ROS包的 `hppfcl` 模块名）：
+
+```bash
+conda install -c conda-forge coal
+```
+
+下面是直接接入OMPL的完整示例。环境可混合使用sphere、box、cylinder和三角
+网格；所有环境位姿均在世界坐标系，无人机四元数统一为 `wxyz`：
+
+```python
+from coal_collision import CoalCollisionChecker, StaticCollisionObject
+from ompl_se3_planner import OMPLSE3Planner
+
+environment = (
+    StaticCollisionObject.box(
+        "wall",
+        size=(0.20, 4.0, 2.5),
+        position=(0.0, 0.0, 1.25),
+    ),
+    StaticCollisionObject.mesh(
+        "building",
+        "environment/building.stl",
+        position=(3.0, 0.0, 0.0),
+    ),
+)
+checker = CoalCollisionChecker.from_urdf(
+    "etc/URDF-for-gazebo/urdf/HDJQR-0102-0055.SLDASM.urdf",
+    environment,
+    link_name="base_link",
+    safety_margin=0.08,
+)
+planner = OMPLSE3Planner(
+    bounds_min=(-5.0, -5.0, 0.2),
+    bounds_max=(5.0, 5.0, 4.0),
+    obstacles=(),
+    vehicle_radius=0.0,
+    safety_margin=0.0,
+    collision_checker=checker,
+)
+```
+
+`planner.plan(start, goal)` 的起点、终点、RRTConnect采样状态、路径简化以及
+最终稠密路径复检都会经过完整SE(3)碰撞检查。单点和批量复检接口分别为：
+
+```python
+checker.is_collision_free(position, quaternion_wxyz)
+checker.check_pose(position, quaternion_wxyz)
+clearance = planner.clearance(path.states[:, :3], path.states[:, 3:7])
+```
+
+`check_pose` 会返回安全裕量修正后的有符号净空，以及距离最近的无人机碰撞体
+和环境物体名称。启用姿态感知后，`planner.clearance` 强制要求同时传入四元数，
+防止后处理阶段意外退化成只检查位置。
 
 ---
 

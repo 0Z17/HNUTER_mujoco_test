@@ -15,7 +15,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -120,12 +120,37 @@ class PlannedSE3Path:
         object.__setattr__(self, "states", states)
 
 
+@runtime_checkable
+class SE3CollisionChecker(Protocol):
+    """Interface for an orientation-aware external collision backend."""
+
+    def is_collision_free(
+        self,
+        position: ArrayLike,
+        quaternion: ArrayLike,
+    ) -> bool:
+        """Return whether one world-frame SE(3) pose is collision-free."""
+
+        ...
+
+    def clearance(
+        self,
+        positions: ArrayLike,
+        quaternions: ArrayLike,
+    ) -> FloatArray:
+        """Return signed clearance with the poses' leading shape."""
+
+        ...
+
+
 class OMPLSE3Planner:
     """Collision-aware SE(3) planner backed by OMPL RRTConnect.
 
-    The HNUTER is conservatively represented by a bounding sphere.  Spherical
-    obstacles are inflated by ``vehicle_radius + safety_margin`` so OMPL's
-    point-position validity check accounts for vehicle extent.
+    The legacy collision mode conservatively represents the HNUTER by a
+    bounding sphere.  An orientation-aware backend such as
+    :class:`coal_collision.CoalCollisionChecker` can additionally or instead
+    be supplied through ``collision_checker``.  OMPL then validates the full
+    sampled position and quaternion rather than position alone.
     """
 
     def __init__(
@@ -138,6 +163,7 @@ class OMPLSE3Planner:
         validity_resolution: float = 0.01,
         planner_range: float = 0.45,
         seed: int = 7,
+        collision_checker: SE3CollisionChecker | None = None,
     ) -> None:
         self.bounds_min = np.asarray(bounds_min, dtype=np.float64)
         self.bounds_max = np.asarray(bounds_max, dtype=np.float64)
@@ -147,6 +173,7 @@ class OMPLSE3Planner:
         self.validity_resolution = float(validity_resolution)
         self.planner_range = float(planner_range)
         self.seed = int(seed)
+        self.collision_checker = collision_checker
         if (
             self.bounds_min.shape != (3,)
             or self.bounds_max.shape != (3,)
@@ -165,28 +192,80 @@ class OMPLSE3Planner:
             raise ValueError("validity_resolution must lie in (0, 1]")
         if self.planner_range <= 0.0:
             raise ValueError("planner_range must be positive")
+        if collision_checker is not None and not isinstance(
+            collision_checker, SE3CollisionChecker
+        ):
+            raise TypeError(
+                "collision_checker must implement is_collision_free() "
+                "and clearance()"
+            )
 
     @property
     def collision_padding(self) -> float:
         return self.vehicle_radius + self.safety_margin
 
-    def clearance(self, positions: ArrayLike) -> FloatArray:
-        """Signed clearance to the closest inflated obstacle."""
+    @property
+    def has_collision_constraints(self) -> bool:
+        """Whether either legacy or orientation-aware obstacles are active."""
+
+        return bool(self.obstacles) or self.collision_checker is not None
+
+    def clearance(
+        self,
+        positions: ArrayLike,
+        quaternions: ArrayLike | None = None,
+    ) -> FloatArray:
+        """Signed clearance to every configured collision representation.
+
+        Quaternions may be omitted in legacy bounding-sphere mode.  They are
+        mandatory when an orientation-aware checker is configured so a caller
+        cannot accidentally validate a tilted vehicle as a point.
+        """
 
         position_array = np.asarray(positions, dtype=np.float64)
-        if position_array.shape[-1] != 3:
-            raise ValueError("positions must have trailing dimension 3")
-        if not self.obstacles:
+        if position_array.shape[-1:] != (3,) or not np.all(
+            np.isfinite(position_array)
+        ):
+            raise ValueError(
+                "positions must be finite with trailing dimension 3"
+            )
+        clearance_fields: list[FloatArray] = []
+        if self.obstacles:
+            legacy_clearances = [
+                np.linalg.norm(position_array - obstacle.center, axis=-1)
+                - obstacle.radius
+                - self.collision_padding
+                for obstacle in self.obstacles
+            ]
+            clearance_fields.append(
+                np.min(np.stack(legacy_clearances, axis=-1), axis=-1)
+            )
+        if self.collision_checker is not None:
+            if quaternions is None:
+                raise ValueError(
+                    "quaternions are required by the orientation-aware "
+                    "collision checker"
+                )
+            external_clearance = np.asarray(
+                self.collision_checker.clearance(positions, quaternions),
+                dtype=np.float64,
+            )
+            if external_clearance.shape != position_array.shape[:-1]:
+                raise ValueError(
+                    "collision checker clearance returned an invalid shape"
+                )
+            clearance_fields.append(external_clearance)
+        if not clearance_fields:
             return np.full(position_array.shape[:-1], np.inf)
-        clearances = [
-            np.linalg.norm(position_array - obstacle.center, axis=-1)
-            - obstacle.radius
-            - self.collision_padding
-            for obstacle in self.obstacles
-        ]
-        return np.min(np.stack(clearances, axis=-1), axis=-1)
+        return np.min(np.stack(clearance_fields, axis=-1), axis=-1)
 
     def is_position_valid(self, position: ArrayLike) -> bool:
+        """Check bounds and legacy position-only obstacles.
+
+        Use :meth:`is_pose_valid` when an orientation-aware checker is
+        configured.  This method deliberately does not invent an attitude.
+        """
+
         position_array = np.asarray(position, dtype=np.float64)
         if position_array.shape != (3,) or not np.all(
             np.isfinite(position_array)
@@ -196,7 +275,40 @@ class OMPLSE3Planner:
             position_array > self.bounds_max
         ):
             return False
-        return bool(self.clearance(position_array) > 0.0)
+        if not self.obstacles:
+            return True
+        legacy_clearances = [
+            np.linalg.norm(position_array - obstacle.center)
+            - obstacle.radius
+            - self.collision_padding
+            for obstacle in self.obstacles
+        ]
+        return bool(min(legacy_clearances) > 0.0)
+
+    def is_pose_valid(
+        self,
+        position: ArrayLike,
+        quaternion: ArrayLike,
+    ) -> bool:
+        """Check workspace bounds and all collisions for one SE(3) pose."""
+
+        position_array = np.asarray(position, dtype=np.float64)
+        quaternion_array = np.asarray(quaternion, dtype=np.float64)
+        if not self.is_position_valid(position_array):
+            return False
+        if quaternion_array.shape != (4,) or not np.all(
+            np.isfinite(quaternion_array)
+        ):
+            return False
+        try:
+            quaternion_array = normalize_quaternion(quaternion_array)
+        except ValueError:
+            return False
+        return self.collision_checker is None or bool(
+            self.collision_checker.is_collision_free(
+                position_array, quaternion_array
+            )
+        )
 
     def plan(
         self,
@@ -215,12 +327,12 @@ class OMPLSE3Planner:
             raise ValueError(
                 "interpolation_resolution must be positive and "
                 "minimum_waypoints must be at least two"
-            )
+        )
         for name, pose in (("start", start), ("goal", goal)):
-            if not self.is_position_valid(pose.position):
+            if not self.is_pose_valid(pose.position, pose.quaternion):
                 raise ValueError(
-                    f"{name} position {pose.position.tolist()} is outside "
-                    "the workspace or collides with an inflated obstacle"
+                    f"{name} pose at {pose.position.tolist()} is outside "
+                    "the workspace or collides with an obstacle"
                 )
 
         ob, og, ou = _load_ompl()
@@ -245,8 +357,14 @@ class OMPLSE3Planner:
         space.setBounds(bounds)
         setup = og.SimpleSetup(space)
         setup.setStateValidityChecker(
-            lambda state: self.is_position_valid(
-                (state.getX(), state.getY(), state.getZ())
+            lambda state: self.is_pose_valid(
+                (state.getX(), state.getY(), state.getZ()),
+                (
+                    state.rotation().w,
+                    state.rotation().x,
+                    state.rotation().y,
+                    state.rotation().z,
+                ),
             )
         )
         setup.getSpaceInformation().setStateValidityCheckingResolution(
@@ -304,7 +422,9 @@ class OMPLSE3Planner:
 
         states[:, 3:7] = normalize_quaternion(states[:, 3:7])
         self._make_quaternion_sequence_continuous(states[:, 3:7])
-        if np.any(self.clearance(states[:, :3]) <= -1.0e-9):
+        if np.any(
+            self.clearance(states[:, :3], states[:, 3:7]) <= -1.0e-9
+        ):
             raise RuntimeError(
                 "OMPL returned a path that failed the application's "
                 "post-planning collision check"

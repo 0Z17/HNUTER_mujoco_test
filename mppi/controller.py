@@ -375,3 +375,233 @@ class MPPIController:
             np.isfinite(reference)
         ):
             raise ValueError("state and reference must contain finite values")
+
+
+class ResidualMPPIController(MPPIController):
+    """MPPI correction around a time-varying feedforward control sequence.
+
+    The optimized command is ``u = u_ff + delta_u``.  Only the residual
+    sequence is shifted between receding-horizon updates, so an analytic
+    trajectory feedforward remains the nominal solution while MPPI supplies
+    state-dependent tracking and obstacle-avoidance corrections.
+    """
+
+    def __init__(
+        self,
+        dynamics: RolloutDynamics,
+        cost: TrajectoryCost,
+        config: MPPIConfig | None = None,
+        rng: np.random.Generator | None = None,
+    ) -> None:
+        super().__init__(dynamics, cost, config, rng)
+        self._nominal_residuals = np.zeros_like(
+            self._nominal_controls
+        )
+        self._previous_residual_action = np.zeros(
+            self.dynamics.control_dim, dtype=np.float64
+        )
+
+    @property
+    def nominal_residuals(self) -> FloatArray:
+        """Return the warm-start correction stored for the next update."""
+
+        return self._nominal_residuals.copy()
+
+    def reset_residuals(
+        self,
+        residuals: ArrayLike | None = None,
+        previous_residual_action: ArrayLike | None = None,
+        previous_action: ArrayLike | None = None,
+    ) -> None:
+        """Clear or replace residual warm starts and continuity anchors."""
+
+        if residuals is None:
+            self._nominal_residuals.fill(0.0)
+        else:
+            residual_array = np.asarray(residuals, dtype=np.float64)
+            if residual_array.shape != self._nominal_residuals.shape:
+                raise ValueError(
+                    "residuals must have shape "
+                    f"{self._nominal_residuals.shape}"
+                )
+            if not np.all(np.isfinite(residual_array)):
+                raise ValueError("residuals must contain finite values")
+            self._nominal_residuals[:] = residual_array
+
+        if previous_residual_action is None:
+            self._previous_residual_action.fill(0.0)
+        else:
+            residual_action = np.asarray(
+                previous_residual_action, dtype=np.float64
+            )
+            if residual_action.shape != (self.dynamics.control_dim,):
+                raise ValueError(
+                    "previous_residual_action must have shape "
+                    f"({self.dynamics.control_dim},)"
+                )
+            self._previous_residual_action[:] = residual_action
+
+        if previous_action is None:
+            self._previous_action.fill(0.0)
+        else:
+            previous_action_array = np.asarray(
+                previous_action, dtype=np.float64
+            )
+            if previous_action_array.shape != (
+                self.dynamics.control_dim,
+            ):
+                raise ValueError(
+                    "previous_action must have shape "
+                    f"({self.dynamics.control_dim},)"
+                )
+            self._previous_action[:] = np.clip(
+                previous_action_array,
+                self._control_min,
+                self._control_max,
+            )
+
+    def command(
+        self,
+        state: ArrayLike,
+        reference: ArrayLike,
+        feedforward_controls: ArrayLike,
+    ) -> MPPIResult:
+        """Optimize residuals around ``feedforward_controls``."""
+
+        initial_state = np.asarray(state, dtype=np.float64)
+        reference_array = np.asarray(reference, dtype=np.float64)
+        feedforward = np.asarray(
+            feedforward_controls, dtype=np.float64
+        )
+        self._validate_inputs(initial_state, reference_array)
+        expected_controls_shape = (
+            self.config.horizon,
+            self.dynamics.control_dim,
+        )
+        if feedforward.shape != expected_controls_shape:
+            raise ValueError(
+                "feedforward_controls must have shape "
+                f"{expected_controls_shape}, got {feedforward.shape}"
+            )
+        if not np.all(np.isfinite(feedforward)):
+            raise ValueError(
+                "feedforward_controls must contain finite values"
+            )
+        feedforward = np.clip(
+            feedforward, self._control_min, self._control_max
+        )
+
+        sampled_controls: FloatArray | None = None
+        sampled_states: FloatArray | None = None
+        costs: FloatArray | None = None
+        weights: FloatArray | None = None
+
+        for _ in range(self.config.num_iterations):
+            nominal_controls = np.clip(
+                feedforward + self._nominal_residuals,
+                self._control_min,
+                self._control_max,
+            )
+            noise = self._sample_noise()
+            sampled_controls = np.clip(
+                nominal_controls[None, :, :] + noise,
+                self._control_min,
+                self._control_max,
+            )
+            effective_noise = (
+                sampled_controls - nominal_controls[None, :, :]
+            )
+            sampled_states = self.dynamics.rollout(
+                initial_state, sampled_controls
+            )
+            costs = self.cost.trajectory_cost(
+                sampled_states, sampled_controls, reference_array
+            )
+            if self.config.action_continuity_weight > 0.0:
+                first_action_delta = (
+                    sampled_controls[:, 0, :] - self._previous_action
+                )
+                costs += self.config.action_continuity_weight * np.sum(
+                    np.square(first_action_delta), axis=1
+                )
+
+            cross_cost = (
+                self.config.likelihood_ratio_weight
+                * self.config.temperature
+                * np.sum(
+                    self._nominal_residuals[None, :, :]
+                    * effective_noise
+                    / (self._sigma[None, None, :] ** 2),
+                    axis=(1, 2),
+                )
+            )
+            costs = costs + cross_cost
+            weights = self._importance_weights(costs)
+            update = np.einsum(
+                "k,khu->hu", weights, effective_noise, optimize=True
+            )
+            updated_controls = np.clip(
+                feedforward + self._nominal_residuals + update,
+                self._control_min,
+                self._control_max,
+            )
+            self._nominal_residuals[:] = (
+                updated_controls - feedforward
+            )
+
+        assert sampled_controls is not None
+        assert sampled_states is not None
+        assert costs is not None
+        assert weights is not None
+
+        optimized_residuals = self._smooth_residual_sequence(
+            self._nominal_residuals
+        )
+        optimized_controls = np.clip(
+            feedforward + optimized_residuals,
+            self._control_min,
+            self._control_max,
+        )
+        optimized_residuals = optimized_controls - feedforward
+        nominal_states = self.dynamics.rollout(
+            initial_state, optimized_controls[None, :, :]
+        )[0]
+        action = optimized_controls[0].copy()
+        self._previous_action[:] = action
+        self._previous_residual_action[:] = optimized_residuals[0]
+        best_index = int(np.argmin(costs))
+        effective_sample_size = float(
+            1.0 / np.sum(np.square(weights))
+        )
+
+        self._nominal_residuals[:-1] = optimized_residuals[1:]
+        self._nominal_residuals[-1] = optimized_residuals[-1]
+
+        return MPPIResult(
+            action=action,
+            nominal_controls=optimized_controls,
+            nominal_states=nominal_states,
+            sampled_controls=sampled_controls,
+            sampled_states=sampled_states,
+            costs=costs,
+            weights=weights,
+            best_index=best_index,
+            effective_sample_size=effective_sample_size,
+        )
+
+    def _smooth_residual_sequence(
+        self, residuals: FloatArray
+    ) -> FloatArray:
+        smoothing = self.config.control_smoothing
+        if smoothing <= 0.0:
+            return residuals.copy()
+
+        smoothed = np.empty_like(residuals)
+        anchor = self._previous_residual_action
+        for index in range(self.config.horizon):
+            smoothed[index] = (
+                smoothing * anchor
+                + (1.0 - smoothing) * residuals[index]
+            )
+            anchor = smoothed[index]
+        return smoothed

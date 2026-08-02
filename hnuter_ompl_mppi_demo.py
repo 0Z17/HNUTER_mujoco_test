@@ -45,6 +45,7 @@ from mppi import (
     MPPIController,
     MPPIResult,
     PoseTrackingCost,
+    ResidualMPPIController,
 )
 from mppi.quaternion import (
     quaternion_error_vector,
@@ -85,6 +86,7 @@ class DemoRun:
     problem: PlanningProblem
     simulation_duration: float
     rerun_recording_path: Path | None = None
+    controller_mode: str = "mppi"
 
 
 class OMPLMPPIVisualizer(PoseTrajectoryVisualizer):
@@ -453,7 +455,17 @@ def create_rerun_recorder(
     recording_path = (
         args.rerun_path
         if args.rerun_path is not None
-        else args.output_dir / "ompl_mppi_recording.rrd"
+        else args.output_dir
+        / (
+            "ompl_mppi_recording.rrd"
+            if getattr(args, "controller", "mppi") == "mppi"
+            else (
+                "ompl_residual_mppi_recording.rrd"
+                if getattr(args, "controller", "mppi")
+                == "residual-mppi"
+                else "ompl_geometric_recording.rrd"
+            )
+        )
     ).resolve()
     recorder = RerunSimulationRecorder(
         RerunRecorderConfig(
@@ -506,6 +518,7 @@ def create_rerun_recorder(
         obstacles=obstacles,
         planned_path_label=problem.path.planner_name,
         metadata={
+            "controller": getattr(args, "controller", "mppi"),
             "planner": problem.path.planner_name,
             "planning_time_ms": (
                 problem.path.planning_time_s * 1.0e3
@@ -613,11 +626,146 @@ def mujoco_joint_positions(
     return positions
 
 
+def geometric_reference_result(
+    reference: FloatArray,
+    linear_acceleration: FloatArray,
+    angular_acceleration: FloatArray,
+    *,
+    attitude_action_index: int = 1,
+) -> MPPIResult:
+    """Package direct trajectory feedforward in the existing result interface.
+
+    This is the no-MPPI ablation baseline: the geometric controller receives
+    the timed trajectory's pose, velocity, and analytic acceleration directly.
+    The result wrapper keeps logging and visualization identical between the
+    two controller modes.
+    """
+
+    reference_array = np.asarray(reference, dtype=np.float64)
+    linear_array = np.asarray(linear_acceleration, dtype=np.float64)
+    angular_array = np.asarray(angular_acceleration, dtype=np.float64)
+    if (
+        reference_array.ndim != 2
+        or reference_array.shape[1] != 13
+        or len(reference_array) < 2
+    ):
+        raise ValueError("reference must have shape (horizon + 1, 13)")
+    expected_acceleration_shape = (len(reference_array), 3)
+    if (
+        linear_array.shape != expected_acceleration_shape
+        or angular_array.shape != expected_acceleration_shape
+    ):
+        raise ValueError(
+            "reference accelerations must have shape "
+            f"{expected_acceleration_shape}"
+        )
+    attitude_index = int(
+        np.clip(attitude_action_index, 1, len(reference_array) - 1)
+    )
+    nominal_controls = reference_feedforward_controls(
+        linear_array,
+        angular_array,
+        attitude_action_index=attitude_index,
+    )
+    action = nominal_controls[0].copy()
+    return MPPIResult(
+        action=action,
+        nominal_controls=nominal_controls,
+        nominal_states=reference_array.copy(),
+        sampled_controls=nominal_controls[None, :, :].copy(),
+        sampled_states=reference_array[None, :, :].copy(),
+        costs=np.zeros(1, dtype=np.float64),
+        weights=np.ones(1, dtype=np.float64),
+        best_index=0,
+        effective_sample_size=float("nan"),
+    )
+
+
+def reference_feedforward_controls(
+    linear_acceleration: FloatArray,
+    angular_acceleration: FloatArray,
+    *,
+    attitude_action_index: int = 1,
+) -> FloatArray:
+    """Build horizon controls aligned with pose-feedback lookahead."""
+
+    linear_array = np.asarray(linear_acceleration, dtype=np.float64)
+    angular_array = np.asarray(angular_acceleration, dtype=np.float64)
+    if (
+        linear_array.ndim != 2
+        or linear_array.shape[1] != 3
+        or angular_array.shape != linear_array.shape
+        or len(linear_array) < 2
+    ):
+        raise ValueError(
+            "linear/angular acceleration must have shape "
+            "(horizon + 1, 3)"
+        )
+    horizon = len(linear_array) - 1
+    lookahead = int(np.clip(attitude_action_index, 1, horizon))
+    angular_indices = np.minimum(
+        np.arange(1, horizon + 1) + lookahead - 1,
+        horizon,
+    )
+    return np.concatenate(
+        (linear_array[1:], angular_array[angular_indices]), axis=1
+    )
+
+
+def reference_with_acceleration(
+    reference_generator: Any,
+    times: FloatArray,
+) -> tuple[FloatArray, FloatArray, FloatArray]:
+    """Sample a timed reference and its feedforward accelerations."""
+
+    sample_full = getattr(reference_generator, "sample_full", None)
+    if callable(sample_full):
+        full = sample_full(times)
+        return (
+            np.asarray(full.reference, dtype=np.float64),
+            np.asarray(
+                full.linear_acceleration_world, dtype=np.float64
+            ),
+            np.asarray(
+                full.angular_acceleration_body, dtype=np.float64
+            ),
+        )
+
+    reference = np.asarray(
+        reference_generator.sample(times), dtype=np.float64
+    )
+    if len(times) < 2:
+        raise ValueError("at least two reference times are required")
+    edge_order = 2 if len(times) >= 3 else 1
+    linear_acceleration = np.gradient(
+        reference[:, 3:6],
+        np.asarray(times, dtype=np.float64),
+        axis=0,
+        edge_order=edge_order,
+    )
+    angular_acceleration = np.gradient(
+        reference[:, 10:13],
+        np.asarray(times, dtype=np.float64),
+        axis=0,
+        edge_order=edge_order,
+    )
+    return reference, linear_acceleration, angular_acceleration
+
+
 def run_demo(
     args: argparse.Namespace, problem: PlanningProblem
 ) -> DemoRun:
     """Track the planned path on the full HNUTER MuJoCo model."""
 
+    controller_mode = str(getattr(args, "controller", "mppi"))
+    if controller_mode not in (
+        "mppi",
+        "residual-mppi",
+        "geometric",
+    ):
+        raise ValueError(
+            "controller must be 'mppi', 'residual-mppi', or 'geometric'"
+        )
     low_level = HnuterController(Path(args.model).resolve())
     low_level.set_freejoint_pose(
         problem.start.position, problem.start.quaternion
@@ -625,40 +773,45 @@ def run_demo(
     control_steps = max(1, int(round(args.control_dt / low_level.dt)))
     control_dt = control_steps * low_level.dt
 
-    obstacle_tuples = tuple(
-        (
-            float(obstacle.center[0]),
-            float(obstacle.center[1]),
-            float(obstacle.center[2]),
-            float(obstacle.radius),
+    mppi: MPPIController | ResidualMPPIController | None = None
+    if controller_mode in ("mppi", "residual-mppi"):
+        obstacle_tuples = tuple(
+            (
+                float(obstacle.center[0]),
+                float(obstacle.center[1]),
+                float(obstacle.center[2]),
+                float(obstacle.radius),
+            )
+            for obstacle in problem.planner.obstacles
         )
-        for obstacle in problem.planner.obstacles
-    )
-    dynamics = FullyActuatedUAVDynamics(dt=control_dt)
-    cost = PoseTrackingCost(
-        terminal_multiplier=args.terminal_multiplier,
-        spherical_obstacles=obstacle_tuples,
-        collision_radius=(
-            problem.planner.collision_padding
-            + float(getattr(args, "mppi_obstacle_margin", 0.0))
-        ),
-        obstacle_penalty=args.obstacle_penalty,
-    )
-    config = MPPIConfig(
-        horizon=args.horizon,
-        num_samples=args.samples,
-        temperature=args.temperature,
-        noise_sigma=(2.3, 2.3, 2.0, 2.6, 2.6, 2.1),
-        control_min=(-4.0, -4.0, -3.5, -6.0, -6.0, -5.0),
-        control_max=(4.0, 4.0, 3.5, 6.0, 6.0, 5.0),
-        noise_correlation=0.60,
-        likelihood_ratio_weight=0.08,
-        action_continuity_weight=args.action_continuity_weight,
-        control_smoothing=args.control_smoothing,
-        num_iterations=args.iterations,
-        seed=args.seed,
-    )
-    mppi = MPPIController(dynamics, cost, config)
+        dynamics = FullyActuatedUAVDynamics(dt=control_dt)
+        cost = PoseTrackingCost(
+            terminal_multiplier=args.terminal_multiplier,
+            spherical_obstacles=obstacle_tuples,
+            collision_radius=(
+                problem.planner.collision_padding
+                + float(getattr(args, "mppi_obstacle_margin", 0.0))
+            ),
+            obstacle_penalty=args.obstacle_penalty,
+        )
+        config = MPPIConfig(
+            horizon=args.horizon,
+            num_samples=args.samples,
+            temperature=args.temperature,
+            noise_sigma=(2.3, 2.3, 2.0, 2.6, 2.6, 2.1),
+            control_min=(-4.0, -4.0, -3.5, -6.0, -6.0, -5.0),
+            control_max=(4.0, 4.0, 3.5, 6.0, 6.0, 5.0),
+            noise_correlation=0.60,
+            likelihood_ratio_weight=0.08,
+            action_continuity_weight=args.action_continuity_weight,
+            control_smoothing=args.control_smoothing,
+            num_iterations=args.iterations,
+            seed=args.seed,
+        )
+        if controller_mode == "residual-mppi":
+            mppi = ResidualMPPIController(dynamics, cost, config)
+        else:
+            mppi = MPPIController(dynamics, cost, config)
     visualizer = OMPLMPPIVisualizer(
         low_level.model,
         problem.path,
@@ -723,17 +876,27 @@ def run_demo(
         f"{np.degrees(problem.path.rotation_length_rad):.1f} deg, "
         f"{problem.path.planning_time_s * 1.0e3:.1f} ms"
     )
+    controller_description = (
+        f"MPPI={args.samples} samples x {args.horizon} steps"
+        if controller_mode == "mppi"
+        else (
+            "TOPP-RA feedforward + residual MPPI="
+            f"{args.samples} samples x {args.horizon} steps"
+        )
+        if controller_mode == "residual-mppi"
+        else "direct geometric trajectory feedforward"
+    )
     print(
         f"Reference duration={problem.reference.duration:.2f}s "
         f"(finish at t={problem.reference.finish_time:.2f}s); "
-        f"MPPI={args.samples} samples x {args.horizon} steps, "
-        f"dt={control_dt:.3f}s"
+        f"{controller_description}, dt={control_dt:.3f}s"
     )
-    if problem.planner.obstacles:
+    if problem.planner.has_collision_constraints:
         minimum_clearance = float(
             np.min(
                 problem.planner.clearance(
-                    problem.path.states[:, :3]
+                    problem.path.states[:, :3],
+                    problem.path.states[:, 3:7],
                 )
             )
         )
@@ -759,16 +922,56 @@ def run_demo(
                 horizon_times = simulation_time + control_dt * np.arange(
                     args.horizon + 1
                 )
-                reference = problem.reference.sample(horizon_times)
                 update_start = time.perf_counter()
-                last_result = mppi.command(state, reference)
+                if controller_mode == "mppi":
+                    reference = problem.reference.sample(horizon_times)
+                    assert mppi is not None
+                    last_result = mppi.command(state, reference)
+                else:
+                    (
+                        reference,
+                        linear_acceleration,
+                        angular_acceleration,
+                    ) = reference_with_acceleration(
+                        problem.reference, horizon_times
+                    )
+                    if controller_mode == "residual-mppi":
+                        assert isinstance(
+                            mppi, ResidualMPPIController
+                        )
+                        feedforward_controls = (
+                            reference_feedforward_controls(
+                                linear_acceleration,
+                                angular_acceleration,
+                                attitude_action_index=(
+                                    args.attitude_lookahead_steps
+                                ),
+                            )
+                        )
+                        last_result = mppi.command(
+                            state,
+                            reference,
+                            feedforward_controls,
+                        )
+                    else:
+                        last_result = geometric_reference_result(
+                            reference,
+                            linear_acceleration,
+                            angular_acceleration,
+                            attitude_action_index=(
+                                args.attitude_lookahead_steps
+                            ),
+                        )
                 update_time_ms = (
                     time.perf_counter() - update_start
                 ) * 1.0e3
 
                 position_target = (
                     reference[1]
-                    if args.position_feedback_source == "reference"
+                    if (
+                        controller_mode == "geometric"
+                        or args.position_feedback_source == "reference"
+                    )
                     else last_result.nominal_states[1]
                 )
                 attitude_index = min(
@@ -776,7 +979,10 @@ def run_demo(
                 )
                 attitude_target = (
                     reference[attitude_index]
-                    if args.attitude_feedback_source == "reference"
+                    if (
+                        controller_mode == "geometric"
+                        or args.attitude_feedback_source == "reference"
+                    )
                     else last_result.nominal_states[attitude_index]
                 )
                 desired = {
@@ -810,7 +1016,10 @@ def run_demo(
 
                 if rerun_recorder is not None:
                     sampled_positions = None
-                    if args.rerun_samples > 0:
+                    if (
+                        controller_mode != "geometric"
+                        and args.rerun_samples > 0
+                    ):
                         selected = np.argsort(last_result.weights)[
                             -min(
                                 args.rerun_samples,
@@ -827,16 +1036,19 @@ def run_demo(
                         "tracking/attitude_error_deg": (
                             attitude_error_deg
                         ),
-                        "mppi/effective_sample_size": (
-                            last_result.effective_sample_size
-                        ),
-                        "mppi/update_time_ms": update_time_ms,
+                        "controller/update_time_ms": update_time_ms,
                     }
-                    if problem.planner.obstacles:
+                    if controller_mode != "geometric":
+                        scalar_channels[
+                            "mppi/effective_sample_size"
+                        ] = last_result.effective_sample_size
+                    if problem.planner.has_collision_constraints:
                         scalar_channels[
                             "obstacles/signed_clearance_m"
                         ] = float(
-                            problem.planner.clearance(state[:3])
+                            problem.planner.clearance(
+                                state[:3], state[6:10]
+                            )
                         )
                     scalar_channels.update(
                         mujoco_scalar_channels(
@@ -872,12 +1084,18 @@ def run_demo(
                         np.asarray(flight_history),
                     )
                 if simulation_time - last_status_time >= 1.0:
+                    controller_status = (
+                        "ESS="
+                        f"{last_result.effective_sample_size:6.1f}/"
+                        f"{args.samples}"
+                        if controller_mode != "geometric"
+                        else "controller=geometric"
+                    )
                     print(
                         f"t={simulation_time:5.2f}s  "
                         f"|e_p|={position_error:5.3f}m  "
                         f"|e_R|={attitude_error_deg:5.2f}deg  "
-                        f"ESS={last_result.effective_sample_size:6.1f}/"
-                        f"{args.samples}"
+                        f"{controller_status}"
                     )
                     last_status_time = simulation_time
 
@@ -913,6 +1131,7 @@ def run_demo(
             if rerun_recorder is not None
             else None
         ),
+        controller_mode=controller_mode,
     )
 
 
@@ -943,7 +1162,8 @@ def save_planned_path(
             ]
         )
         clearance = problem.planner.clearance(
-            problem.path.states[:, :3]
+            problem.path.states[:, :3],
+            problem.path.states[:, 3:7],
         )
         for index, state in enumerate(problem.path.states):
             writer.writerow(
@@ -959,9 +1179,16 @@ def save_results(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     path_file = save_planned_path(run.problem, output_dir)
-    log_file = output_dir / "ompl_mppi_log.csv"
-    plot_file = output_dir / "ompl_mppi_results.png"
-    metrics_file = output_dir / "ompl_mppi_metrics.json"
+    result_prefix = (
+        "ompl_mppi"
+        if run.controller_mode == "mppi"
+        else "ompl_residual_mppi"
+        if run.controller_mode == "residual-mppi"
+        else "ompl_geometric"
+    )
+    log_file = output_dir / f"{result_prefix}_log.csv"
+    plot_file = output_dir / f"{result_prefix}_results.png"
+    metrics_file = output_dir / f"{result_prefix}_metrics.json"
 
     log = run.log
     metrics = compute_pose_metrics(log)
@@ -982,9 +1209,11 @@ def save_results(
             axis=1,
         )
     )
-    actual_clearance = run.problem.planner.clearance(positions)
+    actual_clearance = run.problem.planner.clearance(
+        positions, quaternions
+    )
     reference_clearance = run.problem.planner.clearance(
-        reference_positions
+        reference_positions, reference_quaternions
     )
 
     with log_file.open("w", newline="", encoding="utf-8") as file:
@@ -1048,8 +1277,11 @@ def save_results(
         )
     )
     metrics_dict = metrics.as_dict()
+    if run.controller_mode == "geometric":
+        metrics_dict["mean_effective_sample_size"] = None
     metrics_dict.update(
         {
+            "controller": run.controller_mode,
             "planner": run.problem.path.planner_name,
             "planning_time_ms": (
                 run.problem.path.planning_time_s * 1.0e3
@@ -1067,23 +1299,24 @@ def save_results(
             "final_goal_attitude_error_deg": final_attitude_error_deg,
             "minimum_actual_obstacle_clearance_m": (
                 float(np.min(actual_clearance))
-                if run.problem.planner.obstacles
+                if run.problem.planner.has_collision_constraints
                 else None
             ),
             "minimum_planned_obstacle_clearance_m": (
                 float(
                     np.min(
                         run.problem.planner.clearance(
-                            run.problem.path.states[:, :3]
+                            run.problem.path.states[:, :3],
+                            run.problem.path.states[:, 3:7],
                         )
                     )
                 )
-                if run.problem.planner.obstacles
+                if run.problem.planner.has_collision_constraints
                 else None
             ),
             "collision_free_actual_trajectory": (
                 bool(np.all(actual_clearance > 0.0))
-                if run.problem.planner.obstacles
+                if run.problem.planner.has_collision_constraints
                 else True
             ),
         }
@@ -1304,7 +1537,7 @@ def _save_plot(
     )
     axis_euler.legend(ncol=3)
 
-    if run.problem.planner.obstacles:
+    if run.problem.planner.has_collision_constraints:
         axis_clearance.plot(
             times, actual_clearance, color="#ef6c00"
         )

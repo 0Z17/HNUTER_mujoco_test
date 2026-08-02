@@ -34,6 +34,7 @@
           rgba="1 1 1 1" />
       </material>
     </visual>
+    <!--
     <collision>
       <origin
         xyz="0 0 0"
@@ -41,6 +42,74 @@
       <geometry>
         <mesh
           filename="package://HDJQR-0102-0055.SLDASM/meshes/base_link.STL" />
+      </geometry>
+    </collision>
+    -->
+    <collision name="base_collision">
+      <origin
+        xyz="0.00318 -0.00008 -0.03412"
+        rpy="0.00000 0.00000 0.00000" />
+      <geometry>
+        <box
+          size="0.49607 0.23920 0.22884" />
+      </geometry>
+    </collision>
+    <collision name="l_leg_collision">
+      <origin
+        xyz="0.11595 0.18060 -0.19515"
+        rpy="0.03489 0.44007 -2.09440" />
+      <geometry>
+        <cylinder
+          radius="0.02193"
+          length="0.23920" />
+      </geometry>
+    </collision>
+    <collision name="l_rotor_collision">
+      <origin
+        xyz="0.00343 0.40827 -0.00572"
+        rpy="0.00000 0.00000 0.00000" />
+      <geometry>
+        <sphere
+          radius="0.23920" />
+      </geometry>
+    </collision>
+    <collision name="r_leg_collision">
+      <origin
+        xyz="0.11577 -0.18087 -0.19514"
+        rpy="-0.03031 0.44007 2.09205" />
+      <geometry>
+        <cylinder
+          radius="0.02193"
+          length="0.23920" />
+      </geometry>
+    </collision>
+    <collision name="r_rotor_collision">
+      <origin
+        xyz="0.00343 -0.40827 -0.00572"
+        rpy="0.00000 0.00000 0.00000" />
+      <geometry>
+        <sphere
+          radius="0.23920" />
+      </geometry>
+    </collision>
+    <collision name="tail_leg_collision">
+      <origin
+        xyz="-0.34587 -0.00008 -0.19523"
+        rpy="0.00000 0.44007 0.00000" />
+      <geometry>
+        <cylinder
+          radius="0.02193"
+          length="0.23920" />
+      </geometry>
+    </collision>
+    <collision name="tail_rotoer_collision">
+      <origin
+        xyz="-0.76800 0.00000 0.00340"
+        rpy="0.00000 0.00000 0.00000" />
+      <geometry>
+        <cylinder
+          radius="0.19934"
+          length="0.05980" />
       </geometry>
     </collision>
   </link>
@@ -74,6 +143,7 @@
           rgba="0.501960784313725 0 0 1" />
       </material>
     </visual>
+    <!--
     <collision>
       <origin
         xyz="0 0 0"
@@ -83,6 +153,7 @@
           filename="package://HDJQR-0102-0055.SLDASM/meshes/xy5.STL" />
       </geometry>
     </collision>
+    -->
   </link>
   <joint
     name="xyj5"
@@ -132,6 +203,7 @@
           rgba="1 1 1 1" />
       </material>
     </visual>
+    <!--
     <collision>
       <origin
         xyz="0 0 0"
@@ -141,6 +213,7 @@
           filename="package://HDJQR-0102-0055.SLDASM/meshes/r2.STL" />
       </geometry>
     </collision>
+    -->
   </link>
   <joint
     name="rj2"
@@ -190,6 +263,7 @@
           rgba="0.780392156862745 0.972549019607843 0.956862745098039 1" />
       </material>
     </visual>
+    <!--
     <collision>
       <origin
         xyz="0 0 0"
@@ -199,6 +273,7 @@
           filename="package://HDJQR-0102-0055.SLDASM/meshes/r1.STL" />
       </geometry>
     </collision>
+    -->
   </link>
   <joint
     name="rj1"
@@ -248,6 +323,7 @@
           rgba="0.501960784313725 0 0 1" />
       </material>
     </visual>
+    <!--
     <collision>
       <origin
         xyz="0 0 0"
@@ -257,6 +333,7 @@
           filename="package://HDJQR-0102-0055.SLDASM/meshes/xy1.STL" />
       </geometry>
     </collision>
+    -->
   </link>
   <joint
     name="xyj1"
@@ -306,6 +383,7 @@
           rgba="0.501960784313725 0 0 1" />
       </material>
     </visual>
+    <!--
     <collision>
       <origin
         xyz="0 0 0"
@@ -315,6 +393,7 @@
           filename="package://HDJQR-0102-0055.SLDASM/meshes/xy2.STL" />
       </geometry>
     </collision>
+    -->
   </link>
   <joint
     name="xyj2"
@@ -364,6 +443,7 @@
           rgba="1 1 1 1" />
       </material>
     </visual>
+    <!--
     <collision>
       <origin
         xyz="0 0 0"
@@ -373,6 +453,7 @@
           filename="package://HDJQR-0102-0055.SLDASM/meshes/l2.STL" />
       </geometry>
     </collision>
+    -->
   </link>
   <joint
     name="lj2"
@@ -422,6 +503,7 @@
           rgba="0.780392156862745 0.972549019607843 0.956862745098039 1" />
       </material>
     </visual>
+    <!--
     <collision>
       <origin
         xyz="0 0 0"
@@ -431,6 +513,7 @@
           filename="package://HDJQR-0102-0055.SLDASM/meshes/l1.STL" />
       </geometry>
     </collision>
+    -->
   </link>
   <joint
     name="lj1"
@@ -480,6 +563,7 @@
           rgba="0.501960784313725 0 0 1" />
       </material>
     </visual>
+    <!--
     <collision>
       <origin
         xyz="0 0 0"
@@ -489,6 +573,7 @@
           filename="package://HDJQR-0102-0055.SLDASM/meshes/xy3.STL" />
       </geometry>
     </collision>
+    -->
   </link>
   <joint
     name="xyj3"
@@ -538,6 +623,7 @@
           rgba="0.501960784313725 0 0 1" />
       </material>
     </visual>
+    <!--
     <collision>
       <origin
         xyz="0 0 0"
@@ -547,6 +633,7 @@
           filename="package://HDJQR-0102-0055.SLDASM/meshes/xy4.STL" />
       </geometry>
     </collision>
+    -->
   </link>
   <joint
     name="xyj4"
