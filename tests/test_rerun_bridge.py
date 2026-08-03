@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from rerun_bridge import (
+    Box3D,
     Pose3D,
     RerunRecorderConfig,
     RerunSimulationRecorder,
@@ -83,6 +84,20 @@ class RerunBridgeTest(unittest.TestCase):
                 planned_path=np.array(
                     [[0.0, 0.0, 1.0], [1.0, 0.5, 1.2]]
                 ),
+                raw_ompl_path=np.array(
+                    [
+                        [0.0, 0.0, 1.0],
+                        [0.5, 0.35, 1.1],
+                        [1.0, 0.5, 1.2],
+                    ]
+                ),
+                interpolating_baseline_path=np.array(
+                    [
+                        [0.0, 0.0, 1.0],
+                        [0.5, 0.28, 1.08],
+                        [1.0, 0.5, 1.2],
+                    ]
+                ),
                 timed_reference_path=np.array(
                     [[0.0, 0.0, 1.0], [1.0, 0.4, 1.2]]
                 ),
@@ -96,6 +111,16 @@ class RerunBridgeTest(unittest.TestCase):
                 ),
                 obstacles=(
                     Sphere3D(np.array([0.5, 0.2, 1.0]), 0.2),
+                ),
+                environment_boxes=(
+                    Box3D(
+                        center=np.array([0.5, 0.0, 0.05]),
+                        half_size=np.array([1.0, 0.8, 0.05]),
+                        quaternion_wxyz=np.array(
+                            [1.0, 0.0, 0.0, 0.0]
+                        ),
+                        label="test floor",
+                    ),
                 ),
                 metadata={"test": True},
             )

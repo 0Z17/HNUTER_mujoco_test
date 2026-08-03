@@ -60,6 +60,7 @@ from ompl_se3_planner import (
     SphereObstacle,
 )
 from rerun_bridge import (
+    Box3D,
     Pose3D,
     RerunRecorderConfig,
     RerunSimulationRecorder,
@@ -504,6 +505,14 @@ def create_rerun_recorder(
     )
     recorder.log_static_scene(
         planned_path=problem.path.states[:, :3],
+        raw_ompl_path=(
+            np.asarray(problem.raw_path_states)[:, :3]
+            if getattr(problem, "raw_path_states", None) is not None
+            else None
+        ),
+        interpolating_baseline_path=getattr(
+            args, "rerun_interpolating_baseline_path", None
+        ),
         timed_reference_path=timed_reference[:, :3],
         start_pose=Pose3D(
             problem.start.position, problem.start.quaternion
@@ -516,6 +525,9 @@ def create_rerun_recorder(
             for waypoint in intermediate_waypoints
         ),
         obstacles=obstacles,
+        environment_boxes=tuple(
+            getattr(args, "rerun_environment_boxes", ())
+        ),
         planned_path_label=problem.path.planner_name,
         metadata={
             "controller": getattr(args, "controller", "mppi"),
@@ -1000,6 +1012,12 @@ def run_demo(
                     reference[0],
                     last_result,
                     update_time_ms,
+                    mujoco_qpos=low_level.data.qpos,
+                    mujoco_qvel=low_level.data.qvel,
+                    mujoco_ctrl=low_level.data.ctrl,
+                    mujoco_actuator_force=(
+                        low_level.data.actuator_force
+                    ),
                 )
                 position_error = float(
                     np.linalg.norm(state[:3] - reference[0, :3])
@@ -1173,7 +1191,7 @@ def save_planned_path(
 
 
 def save_results(
-    run: DemoRun, output_dir: Path
+    run: DemoRun, output_dir: Path, *, save_plot: bool = True
 ) -> tuple[Path, Path, Path, Path]:
     """Save path, closed-loop log, plot and combined planner/tracker metrics."""
 
@@ -1375,18 +1393,19 @@ def save_results(
     with metrics_file.open("w", encoding="utf-8") as file:
         json.dump(metrics_dict, file, indent=2)
 
-    _save_plot(
-        run,
-        metrics,
-        times,
-        positions,
-        reference_positions,
-        euler_deg,
-        reference_euler_deg,
-        attitude_error_deg,
-        actual_clearance,
-        plot_file,
-    )
+    if save_plot:
+        _save_plot(
+            run,
+            metrics,
+            times,
+            positions,
+            reference_positions,
+            euler_deg,
+            reference_euler_deg,
+            attitude_error_deg,
+            actual_clearance,
+            plot_file,
+        )
     return path_file, log_file, plot_file, metrics_file
 
 
@@ -1542,10 +1561,13 @@ def _save_plot(
             times, actual_clearance, color="#ef6c00"
         )
         axis_clearance.axhline(
-            0.0, color="#c62828", linestyle="--", label="collision"
+            0.0,
+            color="#c62828",
+            linestyle="--",
+            label="planning safety boundary",
         )
         axis_clearance.set(
-            title="Signed inflated-obstacle clearance",
+            title="Signed planning-buffer clearance",
             xlabel="time [s]",
             ylabel="clearance [m]",
         )

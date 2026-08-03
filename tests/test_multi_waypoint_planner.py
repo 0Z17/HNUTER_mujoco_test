@@ -24,6 +24,35 @@ from ompl_se3_planner import (
 
 
 class MultiWaypointPlannerTest(unittest.TestCase):
+    def test_segment_position_bounds_are_enforced_by_rrt(self) -> None:
+        identity = np.asarray([1.0, 0.0, 0.0, 0.0])
+        waypoints = (
+            SE3Pose(np.asarray([-1.2, -1.0, 1.0]), identity),
+            SE3Pose(np.asarray([-0.8, 0.0, 1.0]), identity),
+            SE3Pose(np.asarray([1.2, 1.0, 1.0]), identity),
+        )
+        planner = OMPLSE3Planner(
+            bounds_min=(-2.0, -2.0, 0.2),
+            bounds_max=(2.0, 2.0, 2.0),
+            planner_range=0.35,
+            seed=31,
+        )
+        bounds = (
+            (np.asarray([-2.0, -1.2, 0.8]), np.asarray([-0.6, 0.1, 1.2])),
+            (np.asarray([-0.9, -0.1, 0.8]), np.asarray([2.0, 1.2, 1.2])),
+        )
+        plan = MultiWaypointOMPLPlanner(planner).plan(
+            waypoints,
+            segment_position_bounds=bounds,
+            solve_time_per_segment=0.3,
+            minimum_states_per_segment=20,
+            knot_stride=2,
+            spline_samples=120,
+        )
+        for segment, (lower, upper) in zip(plan.segment_paths, bounds):
+            self.assertTrue(np.all(segment.states[:, :3] >= lower - 1.0e-9))
+            self.assertTrue(np.all(segment.states[:, :3] <= upper + 1.0e-9))
+
     def test_constrained_smoother_preserves_hard_waypoints_and_reduces_curvature(
         self,
     ) -> None:
@@ -164,6 +193,7 @@ class MultiWaypointPlannerTest(unittest.TestCase):
             minimum_states_per_segment=30,
             knot_stride=3,
             spline_samples=600,
+            shortest_orientation_guide=True,
         )
         self.assertEqual(len(plan.segment_paths), 4)
         self.assertGreater(plan.minimum_clearance_m, 0.0)
@@ -174,6 +204,7 @@ class MultiWaypointPlannerTest(unittest.TestCase):
             plan.control_point_count, len(plan.raw_states)
         )
         self.assertTrue(np.isfinite(plan.maximum_curvature_per_m))
+        self.assertTrue(plan.orientation_shortcut_applied)
 
         waypoint_states = plan.spline.evaluate(
             plan.waypoint_parameters

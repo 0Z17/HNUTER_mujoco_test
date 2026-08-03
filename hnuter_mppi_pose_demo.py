@@ -14,7 +14,7 @@ from typing import Any
 import mujoco
 import mujoco.viewer
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 from hnuter_control import HnuterController
 from hnuter_mppi_demo import (
@@ -191,10 +191,18 @@ class PoseDemoLog:
     angular_actions: list[FloatArray]
     effective_sample_sizes: list[float]
     update_times_ms: list[float]
+    states: list[FloatArray]
+    reference_states: list[FloatArray]
+    mujoco_qpos: list[FloatArray]
+    mujoco_qvel: list[FloatArray]
+    mujoco_ctrl: list[FloatArray]
+    mujoco_actuator_force: list[FloatArray]
 
     @classmethod
     def empty(cls) -> "PoseDemoLog":
-        return cls([], [], [], [], [], [], [], [], [])
+        return cls(
+            [], [], [], [], [], [], [], [], [], [], [], [], [], [], []
+        )
 
     def append(
         self,
@@ -203,6 +211,11 @@ class PoseDemoLog:
         reference: FloatArray,
         result: MPPIResult,
         update_time_ms: float,
+        *,
+        mujoco_qpos: ArrayLike | None = None,
+        mujoco_qvel: ArrayLike | None = None,
+        mujoco_ctrl: ArrayLike | None = None,
+        mujoco_actuator_force: ArrayLike | None = None,
     ) -> None:
         self.times.append(simulation_time)
         self.positions.append(state[:3].copy())
@@ -213,6 +226,36 @@ class PoseDemoLog:
         self.angular_actions.append(result.action[3:].copy())
         self.effective_sample_sizes.append(result.effective_sample_size)
         self.update_times_ms.append(update_time_ms)
+        self.states.append(np.asarray(state, dtype=np.float64).copy())
+        self.reference_states.append(
+            np.asarray(reference, dtype=np.float64).copy()
+        )
+        self.mujoco_qpos.append(
+            np.asarray(
+                [] if mujoco_qpos is None else mujoco_qpos,
+                dtype=np.float64,
+            ).copy()
+        )
+        self.mujoco_qvel.append(
+            np.asarray(
+                [] if mujoco_qvel is None else mujoco_qvel,
+                dtype=np.float64,
+            ).copy()
+        )
+        self.mujoco_ctrl.append(
+            np.asarray(
+                [] if mujoco_ctrl is None else mujoco_ctrl,
+                dtype=np.float64,
+            ).copy()
+        )
+        self.mujoco_actuator_force.append(
+            np.asarray(
+                []
+                if mujoco_actuator_force is None
+                else mujoco_actuator_force,
+                dtype=np.float64,
+            ).copy()
+        )
 
 
 @dataclass(frozen=True)

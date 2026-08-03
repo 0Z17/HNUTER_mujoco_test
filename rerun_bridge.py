@@ -106,6 +106,37 @@ class Sphere3D:
 
 
 @dataclass(frozen=True)
+class Box3D:
+    """An oriented static box used for environment visualization."""
+
+    center: FloatArray
+    half_size: FloatArray
+    quaternion_wxyz: FloatArray
+    label: str = "environment box"
+    color: Color = (80, 120, 180, 150)
+
+    def __post_init__(self) -> None:
+        center = _vector(self.center, 3, "center")
+        half_size = _vector(self.half_size, 3, "half_size")
+        quaternion = _vector(
+            self.quaternion_wxyz, 4, "quaternion_wxyz"
+        )
+        if np.any(half_size <= 0.0):
+            raise ValueError("box half_size entries must be positive")
+        norm = float(np.linalg.norm(quaternion))
+        if norm < 1.0e-12:
+            raise ValueError("quaternion_wxyz norm must be nonzero")
+        if not self.label:
+            raise ValueError("box label must not be empty")
+        _validate_color(self.color)
+        object.__setattr__(self, "center", center)
+        object.__setattr__(self, "half_size", half_size)
+        object.__setattr__(
+            self, "quaternion_wxyz", quaternion / norm
+        )
+
+
+@dataclass(frozen=True)
 class _RobotLink:
     """One visual link, positioned using the matching MJCF body."""
 
@@ -160,6 +191,8 @@ class RerunSimulationRecorder:
     _NOMINAL_COLOR: Color = (255, 180, 0, 255)
     _SAMPLE_COLOR: Color = (45, 120, 255, 70)
     _PLANNED_COLOR: Color = (0, 180, 190, 255)
+    _RAW_OMPL_COLOR: Color = (145, 85, 215, 190)
+    _INTERPOLATING_COLOR: Color = (245, 145, 20, 220)
 
     def __init__(self, config: RerunRecorderConfig) -> None:
         self.config = config
@@ -201,15 +234,18 @@ class RerunSimulationRecorder:
         self,
         *,
         planned_path: ArrayLike,
+        raw_ompl_path: ArrayLike | None = None,
+        interpolating_baseline_path: ArrayLike | None = None,
         timed_reference_path: ArrayLike | None = None,
         start_pose: Pose3D | None = None,
         goal_pose: Pose3D | None = None,
         waypoint_poses: Sequence[Pose3D] = (),
         obstacles: Sequence[Sphere3D] = (),
+        environment_boxes: Sequence[Box3D] = (),
         planned_path_label: str = "OMPL Bi-RRT",
         metadata: Mapping[str, object] | None = None,
     ) -> None:
-        """Log static paths, endpoint frames, obstacles, and run metadata."""
+        """Log static paths, endpoints, environment, and run metadata."""
 
         self._ensure_open()
         planned = _positions(planned_path, "planned_path")
@@ -223,6 +259,35 @@ class RerunSimulationRecorder:
             ),
             static=True,
         )
+        if raw_ompl_path is not None:
+            raw_path = _positions(raw_ompl_path, "raw_ompl_path")
+            self._recording.log(
+                "world/paths/raw_ompl",
+                self._rr.LineStrips3D(
+                    [raw_path],
+                    colors=[self._RAW_OMPL_COLOR],
+                    radii=[0.009],
+                    labels=["simplified OMPL RRTConnect"],
+                    show_labels=False,
+                ),
+                static=True,
+            )
+        if interpolating_baseline_path is not None:
+            interpolating_path = _positions(
+                interpolating_baseline_path,
+                "interpolating_baseline_path",
+            )
+            self._recording.log(
+                "world/paths/interpolating_baseline",
+                self._rr.LineStrips3D(
+                    [interpolating_path],
+                    colors=[self._INTERPOLATING_COLOR],
+                    radii=[0.011],
+                    labels=["degree-3 interpolating B-spline"],
+                    show_labels=False,
+                ),
+                static=True,
+            )
         if timed_reference_path is not None:
             reference = _positions(
                 timed_reference_path, "timed_reference_path"
@@ -278,6 +343,28 @@ class RerunSimulationRecorder:
                     colors=[obstacle.color for obstacle in obstacles],
                     labels=[obstacle.label for obstacle in obstacles],
                     line_radii=0.008,
+                ),
+                static=True,
+            )
+        if environment_boxes:
+            self._recording.log(
+                "world/environment/collision_boxes",
+                self._rr.Boxes3D(
+                    centers=[box.center for box in environment_boxes],
+                    half_sizes=[
+                        box.half_size for box in environment_boxes
+                    ],
+                    quaternions=[
+                        self._rr.Quaternion(
+                            xyzw=np.roll(box.quaternion_wxyz, -1)
+                        )
+                        for box in environment_boxes
+                    ],
+                    colors=[box.color for box in environment_boxes],
+                    labels=[box.label for box in environment_boxes],
+                    show_labels=False,
+                    radii=0.008,
+                    fill_mode="solid",
                 ),
                 static=True,
             )

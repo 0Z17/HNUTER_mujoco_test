@@ -50,3 +50,5 @@ __pycache__/
 
 # Generated simulation and visualization artifacts
 results/
+datasets/
+*.blend1

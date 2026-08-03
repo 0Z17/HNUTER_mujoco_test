@@ -489,6 +489,7 @@ class MultiWaypointPlan:
     guide_position_rms_m: float
     guide_attitude_rms_rad: float
     maximum_curvature_per_m: float
+    orientation_shortcut_applied: bool
 
     @property
     def intermediate_waypoints(self) -> tuple[SE3Pose, ...]:
@@ -505,6 +506,7 @@ class MultiWaypointOMPLPlanner:
         self,
         waypoints: Sequence[SE3Pose],
         *,
+        segment_position_bounds: Sequence[tuple[ArrayLike, ArrayLike]] | None = None,
         solve_time_per_segment: float = 1.5,
         interpolation_resolution: float = 0.07,
         minimum_states_per_segment: int = 50,
@@ -520,6 +522,7 @@ class MultiWaypointOMPLPlanner:
         smoothing_orientation_jerk_weight: float = 2.5e-13,
         smoothing_clearance_weight_scale: float = 0.30,
         smoothing_max_attempts: int = 4,
+        shortest_orientation_guide: bool = False,
     ) -> MultiWaypointPlan:
         waypoint_tuple = tuple(waypoints)
         if len(waypoint_tuple) < 2:
@@ -540,8 +543,61 @@ class MultiWaypointOMPLPlanner:
         ):
             raise ValueError("invalid constrained smoothing configuration")
 
+        segment_count = len(waypoint_tuple) - 1
+        if segment_position_bounds is None:
+            segment_planners = (self.planner,) * segment_count
+            validated_segment_bounds = None
+        else:
+            if len(segment_position_bounds) != segment_count:
+                raise ValueError(
+                    "segment_position_bounds must contain one bound pair per "
+                    "consecutive waypoint segment"
+                )
+            planners = []
+            normalized_bounds = []
+            for index, (lower, upper) in enumerate(segment_position_bounds):
+                bounds_min = np.maximum(
+                    self.planner.bounds_min,
+                    np.asarray(lower, dtype=np.float64),
+                )
+                bounds_max = np.minimum(
+                    self.planner.bounds_max,
+                    np.asarray(upper, dtype=np.float64),
+                )
+                if (
+                    bounds_min.shape != (3,)
+                    or bounds_max.shape != (3,)
+                    or np.any(bounds_min >= bounds_max)
+                ):
+                    raise ValueError(f"invalid bounds for segment {index}")
+                for pose_name, pose in (
+                    ("start", waypoint_tuple[index]),
+                    ("goal", waypoint_tuple[index + 1]),
+                ):
+                    if np.any(pose.position < bounds_min) or np.any(
+                        pose.position > bounds_max
+                    ):
+                        raise ValueError(
+                            f"segment {index} {pose_name} pose lies outside "
+                            "its position bounds"
+                        )
+                planners.append(OMPLSE3Planner(
+                    bounds_min=bounds_min,
+                    bounds_max=bounds_max,
+                    obstacles=self.planner.obstacles,
+                    vehicle_radius=self.planner.vehicle_radius,
+                    safety_margin=self.planner.safety_margin,
+                    validity_resolution=self.planner.validity_resolution,
+                    planner_range=self.planner.planner_range,
+                    seed=self.planner.seed + index,
+                    collision_checker=self.planner.collision_checker,
+                ))
+                normalized_bounds.append((bounds_min, bounds_max))
+            segment_planners = tuple(planners)
+            validated_segment_bounds = tuple(normalized_bounds)
+
         segments = tuple(
-            self.planner.plan(
+            segment_planner.plan(
                 start,
                 goal,
                 solve_time=solve_time_per_segment,
@@ -549,11 +605,22 @@ class MultiWaypointOMPLPlanner:
                 minimum_waypoints=minimum_states_per_segment,
                 simplify=True,
             )
-            for start, goal in zip(
-                waypoint_tuple[:-1], waypoint_tuple[1:]
+            for segment_planner, start, goal in zip(
+                segment_planners, waypoint_tuple[:-1], waypoint_tuple[1:]
             )
         )
         raw_states, waypoint_indices = _concatenate_segments(segments)
+        orientation_shortcut_applied = False
+        if shortest_orientation_guide:
+            shortcut_states = _shortest_orientation_guide(
+                raw_states, waypoint_indices, waypoint_tuple
+            )
+            shortcut_clearance = self.planner.clearance(
+                shortcut_states[:, :3], shortcut_states[:, 3:7]
+            )
+            if np.all(shortcut_clearance > 0.0):
+                raw_states = shortcut_states
+                orientation_shortcut_applied = True
 
         if spline_method == "constrained-smoothing":
             raw_parameters = _se3_chord_parameters(
@@ -606,6 +673,8 @@ class MultiWaypointOMPLPlanner:
                         spline.waypoint_parameters,
                         spline_samples,
                         stride,
+                        orientation_shortcut_applied,
+                        validated_segment_bounds,
                     )
                 except RuntimeError as error:
                     last_error = error
@@ -649,6 +718,8 @@ class MultiWaypointOMPLPlanner:
                     waypoint_parameters,
                     spline_samples,
                     stride,
+                    orientation_shortcut_applied,
+                    validated_segment_bounds,
                 )
                 return plan
             except RuntimeError as error:
@@ -668,6 +739,8 @@ class MultiWaypointOMPLPlanner:
         waypoint_parameters: FloatArray,
         spline_samples: int,
         stride: int,
+        orientation_shortcut_applied: bool,
+        segment_position_bounds: tuple[tuple[FloatArray, FloatArray], ...] | None,
     ) -> MultiWaypointPlan:
         parameters = np.linspace(0.0, 1.0, spline_samples)
         spline_states = spline.evaluate(parameters)
@@ -681,6 +754,26 @@ class MultiWaypointOMPLPlanner:
         )
         if not np.all(in_bounds):
             raise RuntimeError("B-spline left the planning workspace")
+        if segment_position_bounds is not None:
+            for index, (lower, upper) in enumerate(segment_position_bounds):
+                parameter_lower = float(waypoint_parameters[index])
+                parameter_upper = float(waypoint_parameters[index + 1])
+                mask = (
+                    (parameters >= parameter_lower)
+                    & (parameters <= parameter_upper)
+                )
+                segment_positions = spline_states[mask, :3]
+                if len(segment_positions) == 0:
+                    midpoint = 0.5 * (parameter_lower + parameter_upper)
+                    segment_positions = spline.evaluate(
+                        np.asarray([midpoint])
+                    )[:, :3]
+                if np.any(segment_positions < lower - 1.0e-9) or np.any(
+                    segment_positions > upper + 1.0e-9
+                ):
+                    raise RuntimeError(
+                        f"B-spline left the position bounds for segment {index}"
+                    )
         if np.any(clearance <= 0.0):
             raise RuntimeError(
                 "B-spline collided with an inflated obstacle "
@@ -779,6 +872,7 @@ class MultiWaypointOMPLPlanner:
                 getattr(spline, "guide_attitude_rms_rad", np.nan)
             ),
             maximum_curvature_per_m=float(np.max(curvature)),
+            orientation_shortcut_applied=orientation_shortcut_applied,
         )
 
 
@@ -958,6 +1052,68 @@ def _concatenate_segments(
     combined = np.concatenate(chunks, axis=0)
     _make_quaternions_continuous(combined[:, 3:7])
     return combined, tuple(waypoint_indices)
+
+
+def _shortest_orientation_guide(
+    raw_states: FloatArray,
+    waypoint_indices: Sequence[int],
+    waypoints: Sequence[SE3Pose],
+) -> FloatArray:
+    """Replace SO(3) wandering with segment-wise shortest-path SLERP."""
+
+    guide = np.asarray(raw_states, dtype=np.float64).copy()
+    for segment_index, (begin, end) in enumerate(
+        zip(waypoint_indices[:-1], waypoint_indices[1:])
+    ):
+        positions = guide[begin : end + 1, :3]
+        cumulative = np.concatenate(
+            (
+                [0.0],
+                np.cumsum(
+                    np.linalg.norm(np.diff(positions, axis=0), axis=1)
+                ),
+            )
+        )
+        if cumulative[-1] <= 1.0e-10:
+            fractions = np.linspace(0.0, 1.0, len(positions))
+        else:
+            fractions = cumulative / cumulative[-1]
+        guide[begin : end + 1, 3:7] = _shortest_quaternion_slerp(
+            waypoints[segment_index].quaternion,
+            waypoints[segment_index + 1].quaternion,
+            fractions,
+        )
+    _make_quaternions_continuous(guide[:, 3:7])
+    return guide
+
+
+def _shortest_quaternion_slerp(
+    start: ArrayLike,
+    end: ArrayLike,
+    fractions: ArrayLike,
+) -> FloatArray:
+    start_quaternion = normalize_quaternion(start)
+    end_quaternion = normalize_quaternion(end)
+    values = np.asarray(fractions, dtype=np.float64)
+    dot = float(np.dot(start_quaternion, end_quaternion))
+    if dot < 0.0:
+        end_quaternion = -end_quaternion
+        dot = -dot
+    dot = float(np.clip(dot, -1.0, 1.0))
+    if dot > 1.0 - 1.0e-8:
+        quaternions = (
+            (1.0 - values[:, None]) * start_quaternion
+            + values[:, None] * end_quaternion
+        )
+        return normalize_quaternion(quaternions)
+    angle = float(np.arccos(dot))
+    denominator = float(np.sin(angle))
+    start_weight = np.sin((1.0 - values) * angle) / denominator
+    end_weight = np.sin(values * angle) / denominator
+    return normalize_quaternion(
+        start_weight[:, None] * start_quaternion
+        + end_weight[:, None] * end_quaternion
+    )
 
 
 def _se3_chord_parameters(
