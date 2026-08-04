@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import secrets
 import subprocess
+import sys
 import time
 from typing import Any
 
@@ -137,6 +138,16 @@ def parse_args() -> argparse.Namespace:
         "--no-curobo-filter",
         action="store_true",
         help="skip the cuRobo coarse stage and COAL-check every candidate",
+    )
+    parser.add_argument(
+        "--candidate-mode",
+        choices=("staged", "curobo_first"),
+        default="curobo_first",
+        help=(
+            "staged: cuRobo coarse accept then dense COAL for every remaining "
+            "candidate; curobo_first: try cuRobo-ranked candidates one by one "
+            "through spline fit + COAL validation until one succeeds"
+        ),
     )
     parser.add_argument(
         "pipeline_args", nargs=argparse.REMAINDER,
@@ -306,6 +317,64 @@ def run_curobo_coarse_filter(
     if not output_path.exists():
         raise RuntimeError("cuRobo coarse filter produced no output JSON")
     return json.loads(output_path.read_text(encoding="utf-8"))
+
+
+def default_pipeline_arguments() -> argparse.Namespace:
+    """Build the execution-pipeline argument defaults for in-process fitting."""
+
+    import run_overfit_cube_single_pipeline as pipeline_module
+
+    previous_argv = sys.argv[:]
+    sys.argv = ["run_overfit_cube_single_pipeline.py"]
+    try:
+        return pipeline_module.parse_args()
+    finally:
+        sys.argv = previous_argv
+
+
+def fit_validate_candidate(
+    validation_planner: OMPLSE3Planner,
+    pipeline_args: argparse.Namespace,
+    generated_paths: np.ndarray,
+    candidate_index: int,
+    sampling_time_s: float,
+    required_clearance: float,
+    selected_path: Path,
+    source: str,
+) -> tuple[bool, dict[str, Any], str | None, float]:
+    """Fit and COAL-validate one candidate; returns (ok, record, error, time)."""
+
+    from run_overfit_cube_single_pipeline import plan_external_diffusion_path
+
+    path = generated_paths[candidate_index]
+    np.savez_compressed(
+        selected_path,
+        poses_wxyz=path,
+        candidate_index=np.asarray(candidate_index),
+        sampling_time_s=np.asarray(sampling_time_s),
+        source=np.asarray(source),
+    )
+    metrics = path_metrics(path)
+    record: dict[str, Any] = {
+        "candidate_index": int(candidate_index),
+        "accepted_8cm": True,
+        "minimum_physical_clearance_m": required_clearance,
+        "verified_by": "curobo_spheres+spline_fit",
+        **{key: metrics[key] for key in (
+            "translation_length_m",
+            "rotation_length_deg",
+            "position_acceleration_rms",
+            "position_jerk_rms",
+        )},
+    }
+    started = time.monotonic()
+    try:
+        plan_external_diffusion_path(
+            validation_planner, selected_path.resolve(), pipeline_args
+        )
+        return True, record, None, time.monotonic() - started
+    except (RuntimeError, ValueError, np.linalg.LinAlgError) as error:
+        return False, record, str(error), time.monotonic() - started
 
 
 class SamplerClient:
@@ -578,6 +647,20 @@ def main() -> None:
     sampling_bounds = environment_data["sampling_space"]["position_bounds"]
     bounds_min = np.asarray(sampling_bounds["min"], dtype=np.float64)
     bounds_max = np.asarray(sampling_bounds["max"], dtype=np.float64)
+    validation_planner: OMPLSE3Planner | None = None
+    if args.candidate_mode == "curobo_first":
+        validation_checker = CoalCollisionChecker.from_urdf(
+            urdf_path, environment, safety_margin=args.acceptance_clearance
+        )
+        validation_planner = OMPLSE3Planner(
+            bounds_min=bounds_min,
+            bounds_max=bounds_max,
+            obstacles=(),
+            vehicle_radius=0.0,
+            safety_margin=0.0,
+            seed=seed,
+            collision_checker=validation_checker,
+        )
     task = environment_data.get("task_sampling")
     if not task:
         raise RuntimeError("environment has no task_sampling start/goal regions")
@@ -689,27 +772,108 @@ def main() -> None:
                 f"{int(coarse_accept.sum())}/{len(coarse_accept)}",
                 flush=True,
             )
-        filter_started = time.monotonic()
-        records = candidate_metrics_staged(
-            generated_paths, checker, bounds_min, bounds_max,
-            args.acceptance_clearance, coarse_accept, coarse_clearance,
-        )
-        record["filter_time_s"] = round(
-            time.monotonic() - filter_started, 4
-        )
-        accepted = [item for item in records if item["accepted_8cm"]]
-        record["candidate_count"] = len(records)
-        record["accepted_candidate_count"] = len(accepted)
-        record["result"] = "accepted" if accepted else "no_safe_candidate"
-        print(
-            f"pair {pair_attempt}: {len(accepted)}/{len(records)} candidates "
-            f"meet {100 * args.acceptance_clearance:.0f} cm clearance",
-            flush=True,
-        )
-        if accepted:
-            accepted_records = records
-            selected_start, selected_goal = start, goal
-            break
+        record["candidate_count"] = len(generated_paths)
+        if (
+            args.candidate_mode == "curobo_first"
+            and coarse_accept is not None
+        ):
+            order = [
+                index for index, ok in enumerate(coarse_accept) if bool(ok)
+            ]
+            order.sort(key=lambda index: -float(coarse_clearance[index]))
+            record["candidate_mode"] = "curobo_first"
+            record["curobo_candidate_order"] = order
+            fit_attempts: list[dict[str, Any]] = []
+            fit_records: list[dict[str, Any]] = []
+            filter_started = time.monotonic()
+            pipeline_args = default_pipeline_arguments()
+            assert validation_planner is not None
+            for attempt_index, candidate_index in enumerate(
+                order[: args.maximum_execution_candidates]
+            ):
+                selected_path = (
+                    root / f"selection_candidate_{attempt_index:02d}.npz"
+                )
+                ok, fit_record, error, fit_time = fit_validate_candidate(
+                    validation_planner,
+                    pipeline_args,
+                    generated_paths,
+                    candidate_index,
+                    result["sampling_time_s"],
+                    args.acceptance_clearance,
+                    selected_path,
+                    "U-Net diffusion + inference guidance, cuRobo-ranked",
+                )
+                fit_attempts.append({
+                    "candidate_index": candidate_index,
+                    "ok": ok,
+                    "fit_time_s": round(fit_time, 4),
+                    "error": error,
+                })
+                print(
+                    f"pair {pair_attempt}: candidate {candidate_index} "
+                    f"spline fit+COAL {'OK' if ok else 'FAILED'} "
+                    f"({fit_time:.2f}s)",
+                    flush=True,
+                )
+                if ok:
+                    fit_records.append(fit_record)
+                    break
+            record["fit_time_s"] = round(
+                time.monotonic() - filter_started, 4
+            )
+            record["fit_attempts"] = fit_attempts
+            accepted = fit_records
+            if not accepted:
+                print(
+                    "no cuRobo-ranked candidate fit; falling back to staged "
+                    "COAL filter",
+                    flush=True,
+                )
+                filter_started = time.monotonic()
+                records = candidate_metrics_staged(
+                    generated_paths, checker, bounds_min, bounds_max,
+                    args.acceptance_clearance, coarse_accept, coarse_clearance,
+                )
+                record["filter_time_s"] = round(
+                    time.monotonic() - filter_started, 4
+                )
+                accepted = [item for item in records if item["accepted_8cm"]]
+                accepted_records = records
+            else:
+                record["filter_time_s"] = record["fit_time_s"]
+                accepted_records = fit_records
+            record["accepted_candidate_count"] = len(accepted)
+            record["result"] = "accepted" if accepted else "no_safe_candidate"
+            print(
+                f"pair {pair_attempt}: {len(accepted)} feasible candidate(s)",
+                flush=True,
+            )
+            if accepted:
+                selected_start, selected_goal = start, goal
+                break
+        else:
+            filter_started = time.monotonic()
+            records = candidate_metrics_staged(
+                generated_paths, checker, bounds_min, bounds_max,
+                args.acceptance_clearance, coarse_accept, coarse_clearance,
+            )
+            record["filter_time_s"] = round(
+                time.monotonic() - filter_started, 4
+            )
+            accepted = [item for item in records if item["accepted_8cm"]]
+            record["accepted_candidate_count"] = len(accepted)
+            record["result"] = "accepted" if accepted else "no_safe_candidate"
+            print(
+                f"pair {pair_attempt}: {len(accepted)}/{len(records)} "
+                f"candidates meet {100 * args.acceptance_clearance:.0f} cm "
+                "clearance",
+                flush=True,
+            )
+            if accepted:
+                accepted_records = records
+                selected_start, selected_goal = start, goal
+                break
     finally:
         sampler.close()
     write_json(root / "pair_attempts.json", pair_attempts)
