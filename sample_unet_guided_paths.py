@@ -13,6 +13,7 @@ import torch
 
 from se3_diffusion import (
     DiffusionSchedule,
+    EsdfDistanceField,
     GuidanceConfig,
     PreparedData,
     ddim_sample,
@@ -24,6 +25,13 @@ from train_se3_diffusion import load_model
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_EXPERIMENT = PROJECT_DIR / "results/diffusion_se3_three_stage_v002"
+DEFAULT_SPHERES = (
+    PROJECT_DIR
+    / "etc"
+    / "URDF-for-gazebo"
+    / "config"
+    / "HDJQR-0102-0055.SLDASM_curobo_spheres.yml"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,12 +60,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--guidance-clearance", type=float, default=0.06)
     parser.add_argument("--sample-clip-x0", type=float, default=4.0)
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    parser.add_argument(
+        "--esdf",
+        type=Path,
+        help=(
+            "cached ESDF NPZ; when omitted a grid is built from the "
+            "environment and cached under /tmp"
+        ),
+    )
+    parser.add_argument("--esdf-resolution", type=float, default=0.025)
+    parser.add_argument("--robot-spheres", type=Path, default=DEFAULT_SPHERES)
     args = parser.parse_args()
     if args.candidate_count <= 0 or args.sampling_batch_size <= 0:
         parser.error("candidate count and batch size must be positive")
     if args.ddim_steps < 2 or args.seed < 0:
         parser.error("DDIM steps must be >=2 and seed non-negative")
     return args
+
+
+def _load_or_build_esdf(
+    environment: dict,
+    explicit_path: Path | None,
+    resolution: float,
+    device: torch.device,
+) -> EsdfDistanceField:
+    """Load a cached ESDF or build and cache one for the environment."""
+
+    import tempfile
+
+    if explicit_path is not None:
+        cache_path = explicit_path.expanduser().resolve()
+    else:
+        environment_id = environment.get("environment_id", "environment")
+        cache_path = Path(tempfile.gettempdir()) / (
+            f"esdf_{environment_id}_{resolution:.3f}.npz"
+        )
+    if cache_path.exists():
+        field = EsdfDistanceField.load_cache(cache_path)
+    else:
+        started = time.monotonic()
+        field = EsdfDistanceField.from_environment(
+            environment, resolution=resolution
+        )
+        field.save_cache(cache_path)
+        print(
+            f"built ESDF grid {field.grid.shape} at {resolution} m in "
+            f"{time.monotonic() - started:.1f}s -> {cache_path}",
+            flush=True,
+        )
+    return field.to(device)
 
 
 def main() -> None:
@@ -73,6 +124,31 @@ def main() -> None:
         torch.set_float32_matmul_precision("high")
     prepared = PreparedData.load(args.prepared.resolve())
     model, checkpoint = load_model(args.checkpoint.resolve(), device)
+    environment = json.loads(
+        Path(prepared.environment_path).read_text(encoding="utf-8")
+    )
+    esdf = _load_or_build_esdf(
+        environment,
+        args.esdf,
+        args.esdf_resolution,
+        device,
+    )
+    import yaml
+
+    sphere_payload = yaml.safe_load(
+        args.robot_spheres.expanduser().resolve().read_text(encoding="utf-8")
+    )
+    sphere_items = sphere_payload["collision_spheres"]["base_link"]
+    robot_sphere_centers = torch.from_numpy(
+        np.asarray(
+            [item["center"] for item in sphere_items], dtype=np.float32
+        )
+    ).to(device)
+    robot_sphere_radii = torch.from_numpy(
+        np.asarray(
+            [item["radius"] for item in sphere_items], dtype=np.float32
+        )
+    ).to(device)
     sequence_length = int(checkpoint["architecture"]["sequence_length"])
     start = np.asarray(args.start_pose, dtype=np.float64)
     goal = np.asarray(args.goal_pose, dtype=np.float64)
@@ -87,9 +163,6 @@ def main() -> None:
     schedule = DiffusionSchedule.cosine(checkpoint["diffusion_steps"], device)
     obstacles = torch.from_numpy(prepared.obstacles).float().to(device)
     obstacle_mask = torch.from_numpy(prepared.obstacle_mask).bool().to(device)
-    environment = json.loads(
-        Path(prepared.environment_path).read_text(encoding="utf-8")
-    )
     position_bounds = environment["sampling_space"]["position_bounds"]
     bounds_min = torch.as_tensor(
         position_bounds["min"], dtype=torch.float32, device=device
@@ -115,6 +188,9 @@ def main() -> None:
             min(5, args.ddim_steps), obstacles, obstacle_mask, mean, std,
             bounds_min, bounds_max, guidance, warmup_generator,
             clip_x0=args.sample_clip_x0,
+            esdf=esdf,
+            robot_sphere_centers=robot_sphere_centers,
+            robot_sphere_radii=robot_sphere_radii,
         )
         torch.cuda.synchronize(device)
     started = time.monotonic()
@@ -126,6 +202,9 @@ def main() -> None:
             args.ddim_steps, obstacles, obstacle_mask, mean, std,
             bounds_min, bounds_max, guidance, generator,
             clip_x0=args.sample_clip_x0,
+            esdf=esdf,
+            robot_sphere_centers=robot_sphere_centers,
+            robot_sphere_radii=robot_sphere_radii,
         ).cpu().numpy())
     if device.type == "cuda":
         torch.cuda.synchronize(device)

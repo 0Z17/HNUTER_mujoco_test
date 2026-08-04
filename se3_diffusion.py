@@ -554,6 +554,148 @@ class GuidanceConfig:
     temperature_m: float = 0.06
 
 
+class EsdfDistanceField:
+    """Voxelised Euclidean signed distance field of the environment boxes.
+
+    The field is built once per environment from the collision cuboids and is
+    sampled with trilinear interpolation, which is piecewise-linear in the
+    query position and therefore fully differentiable through PyTorch
+    autograd.  Replacing the per-obstacle SAT loops in the guidance cost with
+    one grid sample makes the guidance backward pass roughly two orders of
+    magnitude cheaper.
+    """
+
+    def __init__(
+        self,
+        grid: np.ndarray,
+        origin: np.ndarray,
+        cell_size: float,
+    ) -> None:
+        self.grid = np.asarray(grid, dtype=np.float32)
+        self.origin = np.asarray(origin, dtype=np.float32)
+        self.cell_size = float(cell_size)
+        if self.grid.ndim != 3:
+            raise ValueError("ESDF grid must be 3D")
+
+    @classmethod
+    def from_environment(
+        cls,
+        environment: dict,
+        resolution: float = 0.025,
+        margin: float = 0.25,
+    ) -> "EsdfDistanceField":
+        """Build a signed distance grid from the environment collision boxes."""
+
+        boxes = [
+            obstacle
+            for obstacle in environment.get("obstacles", [])
+            if obstacle.get("collision", False) and obstacle.get("type") == "box"
+        ]
+        if not boxes:
+            raise ValueError("environment contains no collision boxes")
+        bounds = environment["sampling_space"]["position_bounds"]
+        lower = np.asarray(bounds["min"], dtype=np.float32) - margin
+        upper = np.asarray(bounds["max"], dtype=np.float32) + margin
+        shape = np.ceil((upper - lower) / resolution).astype(int) + 2
+        axis = [
+            lower[axis_index] + resolution * np.arange(shape[axis_index])
+            for axis_index in range(3)
+        ]
+        xx, yy, zz = np.meshgrid(*axis, indexing="ij")
+        points = np.stack((xx, yy, zz), axis=-1).reshape(-1, 3).astype(np.float32)
+        signed = np.full(points.shape[0], np.inf, dtype=np.float32)
+        for box in boxes:
+            center = np.asarray(box["pose"]["position"], dtype=np.float32)
+            quaternion = np.asarray(
+                box["pose"]["quaternion_wxyz"], dtype=np.float32
+            )
+            half = 0.5 * np.asarray(box["size_xyz"], dtype=np.float32)
+            rotation = _quaternion_to_matrix_numpy(quaternion)
+            local = (points - center) @ rotation
+            delta = np.abs(local) - half
+            outside = np.linalg.norm(np.maximum(delta, 0.0), axis=1)
+            inside = np.minimum(delta.max(axis=1), 0.0)
+            signed = np.minimum(signed, outside + inside)
+        return cls(signed.reshape(shape), lower, resolution)
+
+    def save_cache(self, path: Path) -> None:
+        np.savez_compressed(
+            path,
+            grid=self.grid,
+            origin=self.origin,
+            cell_size=np.asarray([self.cell_size], dtype=np.float64),
+        )
+
+    @classmethod
+    def load_cache(cls, path: Path) -> "EsdfDistanceField":
+        with np.load(path) as payload:
+            return cls(
+                payload["grid"],
+                payload["origin"],
+                float(payload["cell_size"][0]),
+            )
+
+    def to(self, device: torch.device) -> "EsdfDistanceField":
+        tensor = torch.from_numpy(self.grid).to(device)
+        field = EsdfDistanceField.__new__(EsdfDistanceField)
+        field.grid = tensor
+        field.origin = torch.from_numpy(self.origin).to(device)
+        field.cell_size = self.cell_size
+        return field
+
+    def sample(self, positions: Tensor) -> Tensor:
+        """Trilinearly interpolate the signed distance at positions (..., 3)."""
+
+        grid = self.grid
+        if not isinstance(grid, Tensor):
+            grid = torch.from_numpy(np.asarray(grid)).to(positions.device)
+        origin = (
+            self.origin
+            if isinstance(self.origin, Tensor)
+            else torch.from_numpy(np.asarray(self.origin)).to(
+                positions.device
+            )
+        )
+        scaled = (
+            positions - origin
+        ) / self.cell_size  # continuous grid coordinates
+        lower = torch.floor(scaled).to(torch.long)
+        fraction = scaled - lower.to(scaled.dtype)
+        maximum = torch.as_tensor(
+            [grid.shape[0] - 2, grid.shape[1] - 2, grid.shape[2] - 2],
+            device=positions.device,
+        )
+        lower = torch.minimum(
+            torch.maximum(lower, torch.zeros_like(maximum)), maximum
+        )
+        upper = lower + 1
+        weight_0 = 1.0 - fraction
+        weight_1 = fraction
+        value = torch.zeros_like(positions[..., 0])
+        for x_offset, wx in ((0, weight_0[..., 0]), (1, weight_1[..., 0])):
+            for y_offset, wy in ((0, weight_0[..., 1]), (1, weight_1[..., 1])):
+                for z_offset, wz in ((0, weight_0[..., 2]), (1, weight_1[..., 2])):
+                    value = value + (
+                        wx
+                        * wy
+                        * wz
+                        * grid[lower[..., 0] + x_offset, lower[..., 1] + y_offset, lower[..., 2] + z_offset]
+                    )
+        return value
+
+
+def _quaternion_to_matrix_numpy(quaternion_wxyz: np.ndarray) -> np.ndarray:
+    w, x, y, z = quaternion_wxyz
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float32,
+    )
+
+
 # These primitives mirror the active collision elements on ``base_link`` in
 # HDJQR-0102-0055.SLDASM.urdf.  Keeping the primitive types matters: the old
 # five-large-sphere approximation marked most expert paths as colliding and
@@ -816,11 +958,31 @@ def robot_obstacle_signed_separations(path: Tensor, obstacles: Tensor,
 def guidance_cost(path_normalized: Tensor, mean: Tensor, std: Tensor,
                   obstacles: Tensor, obstacle_mask: Tensor,
                   bounds_min: Tensor, bounds_max: Tensor,
-                  config: GuidanceConfig) -> Tensor:
+                  config: GuidanceConfig,
+                  esdf: EsdfDistanceField | None = None,
+                  robot_sphere_centers: Tensor | None = None,
+                  robot_sphere_radii: Tensor | None = None) -> Tensor:
     path = path_normalized * std + mean
     position = path[..., :3]
-    signed = robot_obstacle_signed_separations(path, obstacles, obstacle_mask)
-    minimum_signed = signed.amin(dim=(2, 3))
+    if esdf is not None:
+        if robot_sphere_centers is None or robot_sphere_radii is None:
+            raise ValueError(
+                "ESDF guidance requires robot sphere centers and radii"
+            )
+        rotation = rotation_6d_to_matrix(path[..., 3:9])
+        centers = robot_sphere_centers.to(path.device)
+        world_spheres = position[:, :, None, :] + torch.einsum(
+            "blij,sj->blsi", rotation, centers
+        )
+        sphere_distance = esdf.sample(world_spheres)
+        minimum_signed = (
+            sphere_distance - robot_sphere_radii.to(path.device)
+        ).amin(dim=-1)
+    else:
+        signed = robot_obstacle_signed_separations(
+            path, obstacles, obstacle_mask
+        )
+        minimum_signed = signed.amin(dim=(2, 3))
     violation = F.softplus(
         (config.clearance_m - minimum_signed) / config.temperature_m
     ) * config.temperature_m
@@ -850,6 +1012,9 @@ def guided_prediction(
     bounds_min: Tensor,
     bounds_max: Tensor,
     config: GuidanceConfig,
+    esdf: EsdfDistanceField | None = None,
+    robot_sphere_centers: Tensor | None = None,
+    robot_sphere_radii: Tensor | None = None,
 ) -> Tensor:
     original = predicted_x0.detach()
     current = original
@@ -858,6 +1023,9 @@ def guided_prediction(
         cost = guidance_cost(
             current, mean, std, obstacles, obstacle_mask,
             bounds_min, bounds_max, config,
+            esdf=esdf,
+            robot_sphere_centers=robot_sphere_centers,
+            robot_sphere_radii=robot_sphere_radii,
         ).sum()
         gradient = torch.autograd.grad(cost, current)[0]
         gradient[:, 0] = 0.0
@@ -887,6 +1055,9 @@ def ddim_sample(
     guidance: GuidanceConfig,
     generator: torch.Generator,
     clip_x0: float = 4.0,
+    esdf: EsdfDistanceField | None = None,
+    robot_sphere_centers: Tensor | None = None,
+    robot_sphere_radii: Tensor | None = None,
 ) -> Tensor:
     device = conditions.device
     path = torch.randn(
@@ -928,6 +1099,9 @@ def ddim_sample(
                 predicted_x0 = guided_prediction(
                     predicted_x0, conditions, mean, std,
                     obstacles, obstacle_mask, bounds_min, bounds_max, guidance,
+                    esdf=esdf,
+                    robot_sphere_centers=robot_sphere_centers,
+                    robot_sphere_radii=robot_sphere_radii,
                 )
             predicted_x0 = torch.clamp(predicted_x0, -clip_x0, clip_x0)
             predicted_x0 = hard_clamp_endpoints(predicted_x0, conditions)

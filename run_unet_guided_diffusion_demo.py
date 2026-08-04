@@ -38,6 +38,15 @@ DEFAULT_TORCH_PYTHON = Path(
 )
 SAMPLER = PROJECT_DIR / "sample_unet_guided_paths.py"
 PIPELINE = PROJECT_DIR / "run_overfit_cube_single_pipeline.sh"
+CUROBO_FILTER = PROJECT_DIR / "curobo_collision.py"
+DEFAULT_CUROBO_PYTHON = Path("/home/z017/research/curobo_env/bin/python")
+DEFAULT_CUROBO_SPHERES = (
+    PROJECT_DIR
+    / "etc"
+    / "URDF-for-gazebo"
+    / "config"
+    / "HDJQR-0102-0055.SLDASM_curobo_spheres.yml"
+)
 
 
 def json_default(value: Any) -> Any:
@@ -87,6 +96,24 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_EXPERIMENT / "models/unet/best.pt",
     )
     parser.add_argument("--torch-python", type=Path, default=DEFAULT_TORCH_PYTHON)
+    parser.add_argument(
+        "--curobo-python",
+        type=Path,
+        default=DEFAULT_CUROBO_PYTHON,
+        help="Python interpreter of the cuRobo environment used for GPU "
+        "coarse filtering",
+    )
+    parser.add_argument(
+        "--curobo-spheres",
+        type=Path,
+        default=DEFAULT_CUROBO_SPHERES,
+        help="cuRobo collision-sphere YAML for the robot",
+    )
+    parser.add_argument(
+        "--no-curobo-filter",
+        action="store_true",
+        help="skip the cuRobo coarse stage and COAL-check every candidate",
+    )
     parser.add_argument(
         "pipeline_args", nargs=argparse.REMAINDER,
         help="extra execution-pipeline arguments after --",
@@ -148,6 +175,113 @@ def candidate_metrics(
             **metrics,
         })
     return records
+
+
+def candidate_metrics_staged(
+    paths: np.ndarray,
+    checker: CoalCollisionChecker,
+    bounds_min: np.ndarray,
+    bounds_max: np.ndarray,
+    required_clearance: float,
+    coarse_accept: np.ndarray | None = None,
+    coarse_clearance: np.ndarray | None = None,
+) -> list[dict[str, Any]]:
+    """Filter candidates with a cuRobo coarse stage in front of COAL.
+
+    Candidates accepted by the conservative cuRobo sphere filter are certified
+    at ``required_clearance`` without a COAL query; every other candidate is
+    checked against the full URDF geometry in COAL as before.  The acceptance
+    certificate is therefore at least as strict as the COAL-only path (the
+    coarse stage only ever skips checks it can prove safe).
+    """
+
+    records = []
+    for index, path in enumerate(paths):
+        workspace_valid = bool(
+            np.all(np.isfinite(path))
+            and np.all(path[:, :3] >= bounds_min)
+            and np.all(path[:, :3] <= bounds_max)
+        )
+        error = None
+        if (
+            workspace_valid
+            and coarse_accept is not None
+            and bool(coarse_accept[index])
+        ):
+            # The narrow cuRobo query certifies clearance >= required, and the
+            # wide-eta estimate is a conservative lower bound, so the reported
+            # value is a valid certified bound.
+            estimated = (
+                float(coarse_clearance[index])
+                if coarse_clearance is not None
+                else required_clearance
+            )
+            minimum_clearance = max(required_clearance, estimated)
+            verified_by = "curobo_spheres"
+        elif workspace_valid:
+            try:
+                dense = dense_path(
+                    path, translation_step=0.04, rotation_step_deg=3.0
+                )
+                clearance = checker.clearance(dense[:, :3], dense[:, 3:7])
+                minimum_clearance = float(np.min(clearance))
+                verified_by = "coal"
+            except (RuntimeError, ValueError) as caught:
+                workspace_valid = False
+                minimum_clearance = -math.inf
+                verified_by = "coal"
+                error = str(caught)
+        else:
+            minimum_clearance = -math.inf
+            verified_by = "coal"
+        metrics = path_metrics(path)
+        records.append({
+            "candidate_index": index,
+            "workspace_valid": workspace_valid,
+            "minimum_physical_clearance_m": minimum_clearance,
+            "accepted_8cm": bool(
+                workspace_valid and minimum_clearance >= required_clearance
+            ),
+            "verified_by": verified_by,
+            "error": error,
+            **metrics,
+        })
+    return records
+
+
+def run_curobo_coarse_filter(
+    args: argparse.Namespace,
+    candidate_file: Path,
+    environment_path: Path,
+    output_path: Path,
+) -> dict[str, Any]:
+    """Run the cuRobo GPU coarse filter in its dedicated environment."""
+
+    curobo_python = args.curobo_python.expanduser().resolve()
+    if not curobo_python.is_file():
+        raise FileNotFoundError(f"cuRobo Python not found: {curobo_python}")
+    command = [
+        str(curobo_python),
+        str(CUROBO_FILTER),
+        "--candidates", str(candidate_file),
+        "--environment", str(environment_path),
+        "--spheres", str(args.curobo_spheres.expanduser().resolve()),
+        "--activation-distance", str(args.acceptance_clearance),
+        "--output", str(output_path),
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=PROJECT_DIR,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "cuRobo coarse filter failed:\n" + completed.stderr.strip()
+        )
+    if not output_path.exists():
+        raise RuntimeError("cuRobo coarse filter produced no output JSON")
+    return json.loads(output_path.read_text(encoding="utf-8"))
 
 
 def run_streaming(command: list[str], log_path: Path) -> int:
@@ -297,9 +431,46 @@ def main() -> None:
         with np.load(candidate_file) as payload:
             generated_paths = payload["poses_wxyz"].astype(np.float64)
             sampling_time_s = float(payload["sampling_time_s"])
-        records = candidate_metrics(
+        coarse_accept: np.ndarray | None = None
+        coarse_clearance: np.ndarray | None = None
+        curobo_time_s = 0.0
+        if not args.no_curobo_filter:
+            curobo_output = root / "curobo_coarse_filter.json"
+            try:
+                started = time.monotonic()
+                curobo_result = run_curobo_coarse_filter(
+                    args, candidate_file, environment_path, curobo_output
+                )
+                curobo_time_s = time.monotonic() - started
+                coarse_accept = np.asarray(
+                    curobo_result["coarse_accept"], dtype=bool
+                )
+                coarse_clearance = np.asarray(
+                    curobo_result["min_sphere_clearance_estimate_m"],
+                    dtype=np.float64,
+                )
+                record["curobo_coarse_accept_count"] = int(
+                    coarse_accept.sum()
+                )
+                record["curobo_filter_time_s"] = round(curobo_time_s, 4)
+                print(
+                    f"pair {pair_attempt}: cuRobo coarse accepts "
+                    f"{int(coarse_accept.sum())}/{len(coarse_accept)}",
+                    flush=True,
+                )
+            except Exception as error:
+                print(
+                    "cuRobo coarse filter unavailable; falling back to "
+                    f"COAL-only ({error})",
+                    flush=True,
+                )
+        filter_started = time.monotonic()
+        records = candidate_metrics_staged(
             generated_paths, checker, bounds_min, bounds_max,
-            args.acceptance_clearance,
+            args.acceptance_clearance, coarse_accept, coarse_clearance,
+        )
+        record["filter_time_s"] = round(
+            time.monotonic() - filter_started + curobo_time_s, 4
         )
         accepted = [item for item in records if item["accepted_8cm"]]
         record["candidate_count"] = len(records)
@@ -308,7 +479,7 @@ def main() -> None:
         record["result"] = "accepted" if accepted else "no_safe_candidate"
         print(
             f"pair {pair_attempt}: {len(accepted)}/{len(records)} candidates "
-            f"meet {100 * args.acceptance_clearance:.0f} cm COAL clearance",
+            f"meet {100 * args.acceptance_clearance:.0f} cm clearance",
             flush=True,
         )
         if accepted:

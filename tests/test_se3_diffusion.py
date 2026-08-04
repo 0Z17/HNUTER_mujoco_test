@@ -9,6 +9,7 @@ except ImportError:
 
 if torch is not None:
     from se3_diffusion import (
+        EsdfDistanceField,
         DiffusionSchedule,
         GuidanceConfig,
         build_model,
@@ -22,6 +23,41 @@ if torch is not None:
 
 @unittest.skipIf(torch is None, "PyTorch is installed in the training environment")
 class SE3DiffusionTest(unittest.TestCase):
+
+    def test_esdf_linear_field_interpolation_and_gradient(self) -> None:
+        grid = np.broadcast_to(
+            np.arange(10, dtype=np.float32)[:, None, None],
+            (10, 12, 14),
+        ).copy()
+        field = EsdfDistanceField(
+            grid, np.zeros(3, dtype=np.float32), 0.5
+        )
+        position = torch.tensor(
+            [2.3, 1.0, 2.0], dtype=torch.float32, requires_grad=True
+        )
+        value = field.sample(position)
+        value.backward()
+        self.assertAlmostEqual(float(value), 4.6, places=5)
+        # The field value is the grid index = x / cell, so the gradient is
+        # 1 / cell along x.
+        np.testing.assert_allclose(position.grad.numpy(), [2.0, 0.0, 0.0])
+
+    def test_esdf_cache_roundtrip(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        grid = np.random.default_rng(3).normal(size=(4, 5, 6)).astype(
+            np.float32
+        )
+        field = EsdfDistanceField(
+            grid, np.zeros(3, dtype=np.float32), 0.05
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "esdf.npz"
+            field.save_cache(path)
+            restored = EsdfDistanceField.load_cache(path)
+        np.testing.assert_allclose(restored.grid, grid, atol=1e-6)
+        self.assertEqual(restored.cell_size, 0.05)
     def test_pose_representation_round_trip(self) -> None:
         pose = np.asarray([
             [0.1, -0.2, 1.0, 1.0, 0.0, 0.0, 0.0],
