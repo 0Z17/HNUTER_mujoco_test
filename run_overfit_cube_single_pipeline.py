@@ -43,8 +43,9 @@ from mppi.quaternion import (
 from multi_waypoint_planner import (
     InterpolatingSE3BSpline,
     MultiWaypointOMPLPlanner,
+    WaypointConstrainedSmoothingSE3BSpline,
 )
-from ompl_se3_planner import OMPLSE3Planner, SE3Pose
+from ompl_se3_planner import OMPLSE3Planner, PlannedSE3Path, SE3Pose
 from rerun_bridge import Box3D
 from toppra_retiming import ToppraTimedReference
 
@@ -246,6 +247,141 @@ def plan_pose_pair(
         ),
         smoothing_max_attempts=args.smoothing_max_attempts,
         shortest_orientation_guide=not args.no_orientation_shortcut,
+    )
+
+
+def plan_external_diffusion_path(
+    planner: OMPLSE3Planner,
+    path_file: Path,
+    args: argparse.Namespace,
+) -> tuple[SE3Pose, SE3Pose, Any, dict[str, Any]]:
+    """Fit and validate the normal execution spline from a diffusion guide."""
+
+    with np.load(path_file) as payload:
+        if "poses_wxyz" in payload:
+            states = payload["poses_wxyz"].astype(np.float64)
+        elif "states" in payload:
+            states = payload["states"].astype(np.float64)
+        else:
+            raise ValueError(
+                "external path NPZ must contain poses_wxyz or states"
+            )
+        sampling_time_s = float(
+            payload["sampling_time_s"]
+            if "sampling_time_s" in payload else 0.0
+        )
+        source = str(
+            payload["source"] if "source" in payload
+            else "external diffusion guide"
+        )
+    if states.ndim == 3 and len(states) == 1:
+        states = states[0]
+    if (
+        states.ndim != 2
+        or states.shape[1] != 7
+        or len(states) < 8
+        or not np.all(np.isfinite(states))
+    ):
+        raise ValueError("external path must have finite shape (N, 7), N >= 8")
+    states[:, 3:7] = normalize_quaternion(states[:, 3:7])
+    for index in range(1, len(states)):
+        if np.dot(states[index - 1, 3:7], states[index, 3:7]) < 0.0:
+            states[index, 3:7] *= -1.0
+    pose_change = np.linalg.norm(np.diff(states[:, :3], axis=0), axis=1)
+    pose_change += args.orientation_metric_weight * np.linalg.norm(
+        quaternion_error_vector(states[1:, 3:7], states[:-1, 3:7]),
+        axis=1,
+    )
+    keep = np.concatenate(([True], pose_change > 1.0e-8))
+    states = states[keep]
+    if len(states) < 8:
+        raise RuntimeError("external diffusion path has too few distinct poses")
+
+    clearance = planner.clearance(states[:, :3], states[:, 3:7])
+    if np.any(clearance <= 0.0):
+        raise RuntimeError(
+            "external diffusion guide failed the configured COAL margin "
+            f"(minimum adjusted clearance {float(np.min(clearance)):.4f} m)"
+        )
+    start = SE3Pose(states[0, :3], states[0, 3:7])
+    goal = SE3Pose(states[-1, :3], states[-1, 3:7])
+    waypoints = (start, goal)
+    waypoint_indices = (0, len(states) - 1)
+    translation_length = float(
+        np.linalg.norm(np.diff(states[:, :3], axis=0), axis=1).sum()
+    )
+    rotation_length = float(
+        np.linalg.norm(
+            quaternion_error_vector(states[1:, 3:7], states[:-1, 3:7]),
+            axis=1,
+        ).sum()
+    )
+    segment = PlannedSE3Path(
+        states=states.copy(),
+        planning_time_s=sampling_time_s,
+        raw_state_count=len(states),
+        path_length_m=translation_length,
+        rotation_length_rad=rotation_length,
+        planner_name="U-Net diffusion + inference guidance",
+    )
+    clearance_weight = 1.0 + np.square(
+        args.smoothing_clearance_weight_scale
+        / (np.maximum(clearance, 0.0) + 0.01)
+    )
+    clearance_weight = np.minimum(clearance_weight, 400.0)
+    builder = MultiWaypointOMPLPlanner(planner)
+    last_error: Exception | None = None
+    for attempt in range(args.smoothing_max_attempts):
+        stride = max(1, args.spline_knot_stride - attempt)
+        try:
+            spline = WaypointConstrainedSmoothingSE3BSpline(
+                states,
+                waypoint_indices,
+                degree=args.smoothing_degree,
+                control_point_stride=stride,
+                orientation_metric_weight=args.orientation_metric_weight,
+                guide_weight=args.smoothing_guide_weight * 5.0**attempt,
+                guide_sample_weights=clearance_weight,
+                position_acceleration_weight=(
+                    args.smoothing_position_acceleration_weight
+                ),
+                position_jerk_weight=args.smoothing_position_jerk_weight,
+                orientation_acceleration_weight=(
+                    args.smoothing_orientation_acceleration_weight
+                ),
+                orientation_jerk_weight=(
+                    args.smoothing_orientation_jerk_weight
+                ),
+            )
+            plan = builder._build_validated_plan(
+                waypoints,
+                (segment,),
+                states,
+                waypoint_indices,
+                spline,
+                spline.waypoint_parameters,
+                args.spline_samples,
+                stride,
+                False,
+                None,
+            )
+            diagnostics = {
+                "mode": "external_unet_guidance_path",
+                "source": source,
+                "external_path": str(path_file.resolve()),
+                "diffusion_state_count": len(states),
+                "diffusion_sampling_time_s": sampling_time_s,
+                "diffusion_minimum_adjusted_clearance_m": float(
+                    np.min(clearance)
+                ),
+                "spline_fit_attempt": attempt + 1,
+            }
+            return start, goal, plan, diagnostics
+        except (RuntimeError, ValueError, np.linalg.LinAlgError) as error:
+            last_error = error
+    raise RuntimeError(
+        "could not fit a collision-free execution B-spline to the external "
+        f"diffusion guide: {last_error}"
     )
 
 
@@ -1173,6 +1309,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--seed", type=int, default=20270802)
     parser.add_argument(
+        "--external-path",
+        type=Path,
+        help=(
+            "NPZ diffusion guide containing poses_wxyz/states; bypasses OMPL "
+            "generation but still runs B-spline, COAL, TOPP-RA and MPPI"
+        ),
+    )
+    parser.add_argument(
         "--start-pose",
         type=float,
         nargs=7,
@@ -1321,6 +1465,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--seed must be non-negative")
     if (args.start_pose is None) != (args.goal_pose is None):
         parser.error("--start-pose and --goal-pose must be provided together")
+    if args.external_path is not None and args.start_pose is not None:
+        parser.error("--external-path cannot be combined with fixed poses")
     region_values = (
         args.south_region_min,
         args.south_region_max,
@@ -1417,7 +1563,13 @@ def main() -> None:
         collision_checker=collision_checker,
     )
     rng = np.random.default_rng(args.seed)
-    if args.start_pose is None:
+    if args.external_path is not None:
+        start, goal, multi_plan, sampling_diagnostics = (
+            plan_external_diffusion_path(
+                planner, args.external_path.expanduser().resolve(), args
+            )
+        )
+    elif args.start_pose is None:
         start, goal, multi_plan, sampling_diagnostics = sample_and_plan(
             rng, planner, bounds_min, bounds_max, args
         )

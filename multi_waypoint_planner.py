@@ -830,6 +830,15 @@ class MultiWaypointOMPLPlanner:
             out=np.zeros_like(derivative_norm),
             where=derivative_norm > 1.0e-9,
         )
+        segment_planner_names = {
+            segment.planner_name for segment in segments
+        }
+        if len(segment_planner_names) == 1 and next(iter(
+            segment_planner_names
+        )).startswith("U-Net diffusion"):
+            planner_prefix = next(iter(segment_planner_names))
+        else:
+            planner_prefix = f"OMPL RRTConnect x{len(segments)}"
         spline_path = PlannedSE3Path(
             states=spline_states,
             planning_time_s=float(
@@ -845,8 +854,8 @@ class MultiWaypointOMPLPlanner:
                 np.sum(np.linalg.norm(rotation_delta, axis=1))
             ),
             planner_name=(
-                f"OMPL RRTConnect x{len(segments)} + global degree-"
-                f"{spline.degree} {spline.method_name} SE(3) B-spline"
+                f"{planner_prefix} + global degree-{spline.degree} "
+                f"{spline.method_name} SE(3) B-spline"
             ),
         )
         path_indices = tuple(

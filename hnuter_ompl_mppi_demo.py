@@ -1435,6 +1435,8 @@ def _save_plot(
     axis_clearance = figure.add_subplot(grid[1, 2])
 
     planned = run.problem.path.states[:, :3]
+    planner_name = str(run.problem.path.planner_name)
+    diffusion_source = planner_name.startswith("U-Net diffusion")
     raw_path_states = getattr(run.problem, "raw_path_states", None)
     if raw_path_states is not None:
         raw_path = np.asarray(raw_path_states)[:, :3]
@@ -1445,7 +1447,11 @@ def _save_plot(
             color="#8e5ad7",
             alpha=0.42,
             linewidth=1.2,
-            label="raw OMPL segments",
+            label=(
+                "raw U-Net + guidance sample"
+                if diffusion_source
+                else "raw OMPL segments"
+            ),
         )
     axis_3d.plot(
         planned[:, 0],
@@ -1454,9 +1460,13 @@ def _save_plot(
         color="#00a6a6",
         linewidth=3.0,
         label=(
-            "global cubic B-spline"
+            "smoothed SE(3) B-spline"
             if raw_path_states is not None
-            else "OMPL Bi-RRT"
+            else (
+                "U-Net + guidance path"
+                if diffusion_source
+                else "OMPL Bi-RRT"
+            )
         ),
     )
     axis_3d.plot(
