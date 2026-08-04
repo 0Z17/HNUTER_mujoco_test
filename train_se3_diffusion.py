@@ -429,7 +429,11 @@ def train_one_model(
 
 
 def load_model(checkpoint_path: Path, device: torch.device) -> tuple[nn.Module, dict[str, Any]]:
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+        weights_only=False,
+    )
     if checkpoint.get("prediction_type") != "velocity":
         raise RuntimeError(
             f"{checkpoint_path} is not a velocity-prediction checkpoint; retrain it"

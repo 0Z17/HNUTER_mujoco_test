@@ -37,8 +37,10 @@ DEFAULT_TORCH_PYTHON = Path(
     "/home/z017/research/diffusion_model/.envs/mpd-splines/bin/python"
 )
 SAMPLER = PROJECT_DIR / "sample_unet_guided_paths.py"
+SAMPLE_AND_FILTER = PROJECT_DIR / "sample_and_filter_candidates.py"
 PIPELINE = PROJECT_DIR / "run_overfit_cube_single_pipeline.sh"
 CUROBO_FILTER = PROJECT_DIR / "curobo_collision.py"
+DEFAULT_INTEGRATED_PYTHON = Path("/home/z017/research/curobo_env/bin/python")
 DEFAULT_CUROBO_PYTHON = Path("/home/z017/research/curobo_env/bin/python")
 DEFAULT_CUROBO_SPHERES = (
     PROJECT_DIR
@@ -96,6 +98,28 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_EXPERIMENT / "models/unet/best.pt",
     )
     parser.add_argument("--torch-python", type=Path, default=DEFAULT_TORCH_PYTHON)
+    parser.add_argument(
+        "--sampler-python",
+        type=Path,
+        default=DEFAULT_INTEGRATED_PYTHON,
+        help="Python of the integrated sampler+cuRobo environment",
+    )
+    parser.add_argument(
+        "--no-integrated-sampler",
+        action="store_true",
+        help="use the legacy two-subprocess sampler plus cuRobo filter path",
+    )
+    parser.add_argument(
+        "--no-persistent-sampler",
+        action="store_true",
+        help="start the integrated sampler per pair attempt instead of "
+        "keeping it resident",
+    )
+    parser.add_argument(
+        "--esdf",
+        type=Path,
+        help="cached ESDF NPZ passed to the integrated sampler",
+    )
     parser.add_argument(
         "--curobo-python",
         type=Path,
@@ -284,6 +308,237 @@ def run_curobo_coarse_filter(
     return json.loads(output_path.read_text(encoding="utf-8"))
 
 
+class SamplerClient:
+    """Resident or one-shot sampler+cuRobo-filter backend for the demo."""
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self._process: subprocess.Popen[str] | None = None
+        self.integrated = False
+        self.persistent = False
+        if not args.no_integrated_sampler:
+            integrated_python = args.sampler_python.expanduser().resolve()
+            if integrated_python.is_file():
+                self.integrated = True
+                if not args.no_persistent_sampler:
+                    self._start_persistent(integrated_python)
+
+    def _start_persistent(self, integrated_python: Path) -> None:
+        args = self.args
+        command = [
+            str(integrated_python),
+            str(SAMPLE_AND_FILTER),
+            "--serve",
+            "--prepared", str(args.prepared.expanduser().resolve()),
+            "--checkpoint", str(args.checkpoint.expanduser().resolve()),
+            "--environment", str(args.environment.expanduser().resolve()),
+            "--spheres", str(args.curobo_spheres.expanduser().resolve()),
+            "--activation-distance", str(args.acceptance_clearance),
+            "--device", "auto",
+        ]
+        if args.esdf is not None:
+            command += ["--esdf", str(args.esdf.expanduser().resolve())]
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        environment.pop("LD_LIBRARY_PATH", None)
+        self._process = subprocess.Popen(
+            command,
+            cwd=PROJECT_DIR,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=environment,
+        )
+        assert self._process.stdout is not None
+        ready = False
+        for _ in range(600):  # allow up to ~60 s for model/scene init
+            line = self._process.stdout.readline()
+            if not line:
+                break
+            if line.strip() == "READY":
+                ready = True
+                break
+        if not ready:
+            self.close()
+            raise RuntimeError(
+                "integrated sampler worker did not become ready; "
+                "falling back to one-shot mode"
+            )
+        self.persistent = True
+
+    def request(
+        self,
+        start_pose: np.ndarray,
+        goal_pose: np.ndarray,
+        seed: int,
+        candidate_count: int,
+        output_dir: Path,
+    ) -> dict[str, Any]:
+        """Generate and coarse-filter candidates, returning result metadata."""
+
+        if self.integrated:
+            if self.persistent:
+                return self._request_persistent(
+                    start_pose, goal_pose, seed, candidate_count, output_dir
+                )
+            return self._request_one_shot(
+                start_pose, goal_pose, seed, candidate_count, output_dir
+            )
+        return self._request_legacy(
+            start_pose, goal_pose, seed, candidate_count, output_dir
+        )
+
+    def _request_persistent(
+        self,
+        start_pose: np.ndarray,
+        goal_pose: np.ndarray,
+        seed: int,
+        candidate_count: int,
+        output_dir: Path,
+    ) -> dict[str, Any]:
+        assert self._process is not None and self._process.stdin is not None
+        assert self._process.stdout is not None
+        request = {
+            "start_pose": np.asarray(start_pose, dtype=np.float64).tolist(),
+            "goal_pose": np.asarray(goal_pose, dtype=np.float64).tolist(),
+            "seed": int(seed),
+            "candidate_count": int(candidate_count),
+            "output_dir": str(output_dir.expanduser().resolve()),
+        }
+        self._process.stdin.write(json.dumps(request) + "\n")
+        self._process.stdin.flush()
+        response_line = self._process.stdout.readline()
+        if not response_line:
+            raise RuntimeError("integrated sampler worker closed the pipe")
+        response = json.loads(response_line)
+        if not response.get("ok", False):
+            raise RuntimeError(
+                f"integrated sampler failed: {response.get('error')}"
+            )
+        return response
+
+    def _request_one_shot(
+        self,
+        start_pose: np.ndarray,
+        goal_pose: np.ndarray,
+        seed: int,
+        candidate_count: int,
+        output_dir: Path,
+    ) -> dict[str, Any]:
+        args = self.args
+        command = [
+            str(args.sampler_python.expanduser().resolve()),
+            str(SAMPLE_AND_FILTER),
+            "--prepared", str(args.prepared.expanduser().resolve()),
+            "--checkpoint", str(args.checkpoint.expanduser().resolve()),
+            "--environment", str(args.environment.expanduser().resolve()),
+            "--spheres", str(args.curobo_spheres.expanduser().resolve()),
+            "--activation-distance", str(args.acceptance_clearance),
+            "--output-dir", str(output_dir.expanduser().resolve()),
+            "--start-pose", *map(str, np.asarray(start_pose, dtype=np.float64)),
+            "--goal-pose", *map(str, np.asarray(goal_pose, dtype=np.float64)),
+            "--candidate-count", str(candidate_count),
+            "--sampling-batch-size", str(min(candidate_count, 32)),
+            "--seed", str(seed),
+            "--device", "auto",
+        ]
+        if args.esdf is not None:
+            command += ["--esdf", str(args.esdf.expanduser().resolve())]
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        environment.pop("LD_LIBRARY_PATH", None)
+        completed = subprocess.run(
+            command,
+            cwd=PROJECT_DIR,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "integrated sampler failed:\n" + completed.stderr.strip()
+            )
+        for line in completed.stdout.splitlines():
+            if line.startswith("SAMPLE_FILTER="):
+                return json.loads(line[len("SAMPLE_FILTER="):])
+        raise RuntimeError("integrated sampler produced no summary line")
+
+    def _request_legacy(
+        self,
+        start_pose: np.ndarray,
+        goal_pose: np.ndarray,
+        seed: int,
+        candidate_count: int,
+        output_dir: Path,
+    ) -> dict[str, Any]:
+        args = self.args
+        candidate_file = output_dir.expanduser().resolve() / "diffusion_candidates.npz"
+        command = [
+            str(args.torch_python.expanduser().resolve()),
+            str(SAMPLER),
+            "--prepared", str(args.prepared.expanduser().resolve()),
+            "--checkpoint", str(args.checkpoint.expanduser().resolve()),
+            "--output", str(candidate_file),
+            "--start-pose", *map(str, np.asarray(start_pose, dtype=np.float64)),
+            "--goal-pose", *map(str, np.asarray(goal_pose, dtype=np.float64)),
+            "--candidate-count", str(candidate_count),
+            "--sampling-batch-size", str(min(candidate_count, 32)),
+            "--seed", str(seed),
+            "--device", "auto",
+        ]
+        environment = os.environ.copy()
+        environment.pop("PYTHONPATH", None)
+        environment.pop("LD_LIBRARY_PATH", None)
+        completed = subprocess.run(
+            command,
+            cwd=PROJECT_DIR,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "PyTorch sampler failed:\n" + completed.stderr.strip()
+            )
+        with np.load(candidate_file) as payload:
+            sampling_time_s = float(payload["sampling_time_s"])
+        coarse_accept: list[bool] = [True] * candidate_count
+        coarse_clearance = [float("nan")] * candidate_count
+        if not args.no_curobo_filter:
+            curobo_output = output_dir.expanduser().resolve() / "curobo_coarse_filter.json"
+            curobo_result = run_curobo_coarse_filter(
+                args, candidate_file, args.environment.expanduser().resolve(),
+                curobo_output,
+            )
+            coarse_accept = curobo_result["coarse_accept"]
+            coarse_clearance = curobo_result[
+                "min_sphere_clearance_estimate_m"
+            ]
+        return {
+            "output_dir": str(output_dir.expanduser().resolve()),
+            "candidate_file": str(candidate_file),
+            "candidate_count": candidate_count,
+            "sampling_time_s": sampling_time_s,
+            "coarse_accept": coarse_accept,
+            "min_sphere_clearance_estimate_m": coarse_clearance,
+            "coarse_accept_count": int(sum(coarse_accept)),
+        }
+
+    def close(self) -> None:
+        if self._process is None:
+            return
+        try:
+            if self._process.stdin is not None:
+                self._process.stdin.write("quit\n")
+                self._process.stdin.flush()
+            self._process.wait(timeout=10)
+        except Exception:  # noqa: BLE001 - best-effort shutdown
+            self._process.kill()
+        self._process = None
+
+
 def run_streaming(command: list[str], log_path: Path) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8") as log:
@@ -345,7 +600,9 @@ def main() -> None:
     generated_paths: np.ndarray | None = None
     selected_start = selected_goal = None
     candidate_file = root / "diffusion_candidates.npz"
-    for pair_attempt in range(1, args.maximum_pair_attempts + 1):
+    sampler = SamplerClient(args)
+    try:
+      for pair_attempt in range(1, args.maximum_pair_attempts + 1):
         start, start_tries, start_clearance = sample_valid_pose(
             rng, planner, south_min, south_max,
             max_tilt_deg=args.max_tilt_deg,
@@ -388,94 +645,61 @@ def main() -> None:
             np.random.SeedSequence([seed, pair_attempt, 9000])
             .generate_state(1, dtype=np.uint32)[0] & 0x7FFFFFFF
         )
-        command = [
-            str(args.torch_python.expanduser().resolve()),
-            str(SAMPLER),
-            "--prepared", str(args.prepared.expanduser().resolve()),
-            "--checkpoint", str(args.checkpoint.expanduser().resolve()),
-            "--output", str(candidate_file),
-            "--start-pose", *map(str, np.concatenate((start.position, start.quaternion))),
-            "--goal-pose", *map(str, np.concatenate((goal.position, goal.quaternion))),
-            "--candidate-count", str(args.candidate_count),
-            "--sampling-batch-size", str(min(args.candidate_count, 32)),
-            "--seed", str(sampler_seed),
-            "--device", "auto",
-        ]
         print(
             f"pair {pair_attempt}: sampling {args.candidate_count} guided paths",
             flush=True,
         )
-        sampler_environment = os.environ.copy()
-        # The outer runtime may inject Python-3.12 COAL packages. The model
-        # sampler is Python 3.10 and must resolve NumPy/Torch exclusively from
-        # its own environment.
-        sampler_environment.pop("PYTHONPATH", None)
-        sampler_environment.pop("LD_LIBRARY_PATH", None)
-        completed = subprocess.run(
-            command,
-            cwd=PROJECT_DIR,
-            capture_output=True,
-            text=True,
-            env=sampler_environment,
-        )
         record["sampler_seed"] = sampler_seed
-        record["sampler_stdout"] = completed.stdout.strip()
-        if completed.returncode != 0:
+        sampler_started = time.monotonic()
+        try:
+            result = sampler.request(
+                np.concatenate((start.position, start.quaternion)),
+                np.concatenate((goal.position, goal.quaternion)),
+                sampler_seed,
+                args.candidate_count,
+                root,
+            )
+        except Exception as error:
             record["result"] = "sampling_failed"
-            record["sampler_error"] = completed.stderr.strip()
+            record["sampler_error"] = str(error)
             write_json(root / "pair_attempts.json", pair_attempts)
             raise RuntimeError(
-                "PyTorch sampler failed before candidate validation:\n"
-                + completed.stderr.strip()
+                "sampler failed before candidate validation:\n" + str(error)
             )
+        record["sampler_wall_time_s"] = round(
+            time.monotonic() - sampler_started, 4
+        )
+        record["sampling_time_s"] = result["sampling_time_s"]
+        record["curobo_filter_time_s"] = result.get(
+            "curobo_filter_time_s", 0.0
+        )
+        candidate_file = Path(result["candidate_file"])
         with np.load(candidate_file) as payload:
             generated_paths = payload["poses_wxyz"].astype(np.float64)
-            sampling_time_s = float(payload["sampling_time_s"])
         coarse_accept: np.ndarray | None = None
         coarse_clearance: np.ndarray | None = None
-        curobo_time_s = 0.0
         if not args.no_curobo_filter:
-            curobo_output = root / "curobo_coarse_filter.json"
-            try:
-                started = time.monotonic()
-                curobo_result = run_curobo_coarse_filter(
-                    args, candidate_file, environment_path, curobo_output
-                )
-                curobo_time_s = time.monotonic() - started
-                coarse_accept = np.asarray(
-                    curobo_result["coarse_accept"], dtype=bool
-                )
-                coarse_clearance = np.asarray(
-                    curobo_result["min_sphere_clearance_estimate_m"],
-                    dtype=np.float64,
-                )
-                record["curobo_coarse_accept_count"] = int(
-                    coarse_accept.sum()
-                )
-                record["curobo_filter_time_s"] = round(curobo_time_s, 4)
-                print(
-                    f"pair {pair_attempt}: cuRobo coarse accepts "
-                    f"{int(coarse_accept.sum())}/{len(coarse_accept)}",
-                    flush=True,
-                )
-            except Exception as error:
-                print(
-                    "cuRobo coarse filter unavailable; falling back to "
-                    f"COAL-only ({error})",
-                    flush=True,
-                )
+            coarse_accept = np.asarray(result["coarse_accept"], dtype=bool)
+            coarse_clearance = np.asarray(
+                result["min_sphere_clearance_estimate_m"], dtype=np.float64
+            )
+            record["curobo_coarse_accept_count"] = int(coarse_accept.sum())
+            print(
+                f"pair {pair_attempt}: cuRobo coarse accepts "
+                f"{int(coarse_accept.sum())}/{len(coarse_accept)}",
+                flush=True,
+            )
         filter_started = time.monotonic()
         records = candidate_metrics_staged(
             generated_paths, checker, bounds_min, bounds_max,
             args.acceptance_clearance, coarse_accept, coarse_clearance,
         )
         record["filter_time_s"] = round(
-            time.monotonic() - filter_started + curobo_time_s, 4
+            time.monotonic() - filter_started, 4
         )
         accepted = [item for item in records if item["accepted_8cm"]]
         record["candidate_count"] = len(records)
         record["accepted_candidate_count"] = len(accepted)
-        record["sampling_time_s"] = sampling_time_s
         record["result"] = "accepted" if accepted else "no_safe_candidate"
         print(
             f"pair {pair_attempt}: {len(accepted)}/{len(records)} candidates "
@@ -486,6 +710,8 @@ def main() -> None:
             accepted_records = records
             selected_start, selected_goal = start, goal
             break
+    finally:
+        sampler.close()
     write_json(root / "pair_attempts.json", pair_attempts)
     if accepted_records is None or generated_paths is None:
         raise RuntimeError(
