@@ -91,6 +91,24 @@ class RerunBridgeTest(unittest.TestCase):
                         [1.0, 0.5, 1.2],
                     ]
                 ),
+                raw_path_entity="world/paths/raw_diffusion_guide",
+                raw_path_label="raw U-Net + guidance sample",
+                diffusion_candidates=np.array(
+                    [
+                        [
+                            [0.0, 0.0, 1.0],
+                            [0.4, 0.2, 1.05],
+                            [1.0, 0.5, 1.2],
+                        ],
+                        [
+                            [0.0, 0.0, 1.0],
+                            [0.6, 0.45, 1.15],
+                            [1.0, 0.5, 1.2],
+                        ],
+                    ]
+                ),
+                diffusion_candidate_acceptance=[True, False],
+                diffusion_candidate_clearances=[0.12, 0.03],
                 interpolating_baseline_path=np.array(
                     [
                         [0.0, 0.0, 1.0],

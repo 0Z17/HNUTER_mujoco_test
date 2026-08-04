@@ -355,6 +355,10 @@ def main() -> None:
         command = [
             str(PIPELINE),
             "--external-path", str(selected_path),
+            "--diffusion-candidates", str(candidate_file),
+            "--diffusion-candidate-metrics", str(
+                root / "candidate_metrics.json"
+            ),
             "--output-dir", str(execution_dir),
             "--environment", str(environment_path),
             "--urdf", str(urdf_path),

@@ -503,12 +503,34 @@ def create_rerun_recorder(
     intermediate_waypoints = tuple(
         getattr(problem, "intermediate_waypoints", ())
     )
+    diffusion_source = str(problem.path.planner_name).startswith(
+        "U-Net diffusion"
+    )
     recorder.log_static_scene(
         planned_path=problem.path.states[:, :3],
         raw_ompl_path=(
             np.asarray(problem.raw_path_states)[:, :3]
             if getattr(problem, "raw_path_states", None) is not None
             else None
+        ),
+        raw_path_entity=(
+            "world/paths/raw_diffusion_guide"
+            if diffusion_source
+            else None
+        ),
+        raw_path_label=(
+            "raw U-Net + guidance sample"
+            if diffusion_source
+            else None
+        ),
+        diffusion_candidates=getattr(
+            args, "rerun_diffusion_candidates", None
+        ),
+        diffusion_candidate_acceptance=getattr(
+            args, "rerun_diffusion_candidate_acceptance", None
+        ),
+        diffusion_candidate_clearances=getattr(
+            args, "rerun_diffusion_candidate_clearances", None
         ),
         interpolating_baseline_path=getattr(
             args, "rerun_interpolating_baseline_path", None

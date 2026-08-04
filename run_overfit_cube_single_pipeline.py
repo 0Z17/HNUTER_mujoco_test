@@ -854,11 +854,68 @@ def build_combined_mjcf(
     return output_path
 
 
+def load_diffusion_candidate_overlay(
+    candidates_path: Path | None,
+    metrics_path: Path | None,
+) -> tuple[list[np.ndarray], list[bool], list[float]] | None:
+    """Load all diffusion candidates plus per-candidate COAL audit flags."""
+
+    if candidates_path is None:
+        return None
+    with np.load(candidates_path) as payload:
+        if "poses_wxyz" in payload:
+            states = payload["poses_wxyz"].astype(np.float64)
+        elif "states" in payload:
+            states = payload["states"].astype(np.float64)
+        else:
+            raise ValueError(
+                "diffusion candidates NPZ must contain poses_wxyz or states"
+            )
+    if states.ndim == 2:
+        states = states[np.newaxis, ...]
+    if (
+        states.ndim != 3
+        or states.shape[2] != 7
+        or len(states) < 1
+        or not np.all(np.isfinite(states))
+    ):
+        raise ValueError(
+            "diffusion candidates must have shape (C, N, 7) with C >= 1"
+        )
+    positions = [states[index, :, :3] for index in range(len(states))]
+    acceptance: list[bool] = []
+    clearances: list[float] = []
+    if metrics_path is not None and metrics_path.exists():
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        by_index = {
+            int(record["candidate_index"]): record
+            for record in metrics.get("records", [])
+        }
+        for index in range(len(states)):
+            record = by_index.get(index)
+            if record is None:
+                acceptance.append(False)
+                clearances.append(float("nan"))
+            else:
+                acceptance.append(bool(record.get("accepted_8cm", False)))
+                clearances.append(float(
+                    record.get("minimum_physical_clearance_m", float("nan"))
+                ))
+    else:
+        acceptance = [True] * len(states)
+        clearances = [float("nan")] * len(states)
+    return positions, acceptance, clearances
+
+
 def create_demo_arguments(
     args: argparse.Namespace,
     combined_mjcf: Path,
     output_dir: Path,
 ) -> SimpleNamespace:
+    candidate_overlay = load_diffusion_candidate_overlay(
+        getattr(args, "diffusion_candidates", None),
+        getattr(args, "diffusion_candidate_metrics", None),
+    )
     return SimpleNamespace(
         model=str(combined_mjcf),
         controller="mppi",
@@ -891,6 +948,15 @@ def create_demo_arguments(
         rerun_viewer_port=9876,
         rerun_samples=8,
         rerun_trace_stride=2,
+        rerun_diffusion_candidates=(
+            candidate_overlay[0] if candidate_overlay is not None else None
+        ),
+        rerun_diffusion_candidate_acceptance=(
+            candidate_overlay[1] if candidate_overlay is not None else None
+        ),
+        rerun_diffusion_candidate_clearances=(
+            candidate_overlay[2] if candidate_overlay is not None else None
+        ),
         output_dir=output_dir,
     )
 
@@ -1317,6 +1383,23 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--diffusion-candidates",
+        type=Path,
+        help=(
+            "NPZ containing poses_wxyz/states of every diffusion candidate; "
+            "overlaid in the Rerun recording under world/diffusion_candidates"
+        ),
+    )
+    parser.add_argument(
+        "--diffusion-candidate-metrics",
+        type=Path,
+        help=(
+            "candidate_metrics.json with per-candidate accepted_8cm and "
+            "minimum_physical_clearance_m; must accompany "
+            "--diffusion-candidates"
+        ),
+    )
+    parser.add_argument(
         "--start-pose",
         type=float,
         nargs=7,
@@ -1467,6 +1550,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("--start-pose and --goal-pose must be provided together")
     if args.external_path is not None and args.start_pose is not None:
         parser.error("--external-path cannot be combined with fixed poses")
+    if (
+        args.diffusion_candidate_metrics is not None
+        and args.diffusion_candidates is None
+    ):
+        parser.error(
+            "--diffusion-candidate-metrics requires --diffusion-candidates"
+        )
     region_values = (
         args.south_region_min,
         args.south_region_max,

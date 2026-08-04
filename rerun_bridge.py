@@ -235,6 +235,11 @@ class RerunSimulationRecorder:
         *,
         planned_path: ArrayLike,
         raw_ompl_path: ArrayLike | None = None,
+        raw_path_entity: str | None = None,
+        raw_path_label: str | None = None,
+        diffusion_candidates: Sequence[ArrayLike] | None = None,
+        diffusion_candidate_acceptance: Sequence[bool] | None = None,
+        diffusion_candidate_clearances: Sequence[float] | None = None,
         interpolating_baseline_path: ArrayLike | None = None,
         timed_reference_path: ArrayLike | None = None,
         start_pose: Pose3D | None = None,
@@ -262,15 +267,23 @@ class RerunSimulationRecorder:
         if raw_ompl_path is not None:
             raw_path = _positions(raw_ompl_path, "raw_ompl_path")
             self._recording.log(
-                "world/paths/raw_ompl",
+                raw_path_entity or "world/paths/raw_ompl",
                 self._rr.LineStrips3D(
                     [raw_path],
                     colors=[self._RAW_OMPL_COLOR],
                     radii=[0.009],
-                    labels=["simplified OMPL RRTConnect"],
+                    labels=[
+                        raw_path_label or "simplified OMPL RRTConnect"
+                    ],
                     show_labels=False,
                 ),
                 static=True,
+            )
+        if diffusion_candidates is not None:
+            self._log_diffusion_candidates(
+                diffusion_candidates,
+                diffusion_candidate_acceptance,
+                diffusion_candidate_clearances,
             )
         if interpolating_baseline_path is not None:
             interpolating_path = _positions(
@@ -381,6 +394,54 @@ class RerunSimulationRecorder:
                         default=str,
                     ),
                     media_type="application/json",
+                ),
+                static=True,
+            )
+
+    def _log_diffusion_candidates(
+        self,
+        candidates: Sequence[ArrayLike],
+        acceptance: Sequence[bool] | None,
+        clearances: Sequence[float] | None,
+    ) -> None:
+        """Overlay every raw diffusion candidate under a dedicated group."""
+
+        acceptance_values = (
+            list(acceptance)
+            if acceptance is not None
+            else [None] * len(candidates)
+        )
+        clearance_values = (
+            list(clearances)
+            if clearances is not None
+            else [None] * len(candidates)
+        )
+        for index, (candidate, accepted, clearance) in enumerate(
+            zip(candidates, acceptance_values, clearance_values)
+        ):
+            positions = _positions(
+                candidate, f"diffusion_candidate_{index}"
+            )
+            if accepted is True:
+                color: Color = (70, 200, 105, 150)
+                status = "8 cm safe"
+            elif accepted is False:
+                color = (210, 95, 95, 120)
+                status = "rejected"
+            else:
+                color = (165, 165, 165, 120)
+                status = "candidate"
+            label = f"diffusion candidate {index:02d} · {status}"
+            if clearance is not None:
+                label += f" · {float(clearance) * 100.0:.1f} cm"
+            self._recording.log(
+                f"world/diffusion_candidates/candidate_{index:02d}",
+                self._rr.LineStrips3D(
+                    [positions],
+                    colors=[color],
+                    radii=[0.006],
+                    labels=[label],
+                    show_labels=False,
                 ),
                 static=True,
             )
