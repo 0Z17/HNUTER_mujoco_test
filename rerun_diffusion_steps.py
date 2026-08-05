@@ -4,12 +4,10 @@
 Runs the same guided DDIM sampling as the production sampler and records the
 denoised trajectory at every iteration step into a Rerun recording:
 
-  * ``world/diffusion_steps/path``       - scrubbable on the ``diffusion_step``
-    timeline (solid line, blue -> red over iterations);
+  * ``world/diffusion_steps/path``       - the denoised path changes over the
+    ``diffusion_step`` timeline (solid line, blue -> red over iterations);
   * ``world/diffusion_steps/x0_pred``    - the model's x0 estimate at each step
     (thin translucent line);
-  * ``world/diffusion_steps_all/step_NN`` - every iteration as a static,
-    colour-graded polyline so the whole convergence fan is visible at once;
   * ``world/final_path``                 - the converged path as a thick line;
   * plots: path length, step-to-step displacement, and ESDF+sphere minimum
     clearance per iteration.
@@ -320,23 +318,11 @@ def main() -> None:
             ),
             static=True,
         )
-        step_count = len(steps)
         for sample_index, timestep_value, path_np, x0_np in steps:
             poses = to_poses7(path_np)
             x0_poses = to_poses7(x0_np)
-            fraction = sample_index / max(step_count - 1, 1)
+            fraction = sample_index / max(len(steps) - 1, 1)
             color = gradient_color(fraction)
-            recording.log(
-                f"world/diffusion_steps_all/step_{sample_index:03d}",
-                rr.LineStrips3D(
-                    [poses[:, :3]],
-                    colors=[color],
-                    radii=[0.006],
-                    labels=[f"step {sample_index} (t={timestep_value})"],
-                    show_labels=False,
-                ),
-                static=True,
-            )
             recording.set_time("diffusion_step", sequence=sample_index)
             recording.log(
                 "world/diffusion_steps/path",
