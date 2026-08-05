@@ -70,11 +70,24 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_EXPERIMENT / "models/unet/best.pt",
     )
-    parser.add_argument("--environment", type=Path, required=True)
+    parser.add_argument(
+        "--environment",
+        type=Path,
+        default=PROJECT_DIR / "environment_multihomotopy_v002.json",
+    )
     parser.add_argument("--spheres", type=Path, default=DEFAULT_SPHERES)
-    parser.add_argument("--start-pose", type=float, nargs=7, required=True)
-    parser.add_argument("--goal-pose", type=float, nargs=7, required=True)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--start-pose", type=float, nargs=7)
+    parser.add_argument("--goal-pose", type=float, nargs=7)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument(
+        "--demo-dir",
+        type=Path,
+        help=(
+            "reuse the accepted start/goal and sampler seed from a demo run's "
+            "pair_attempts.json; when omitted and no poses/seed are given, the "
+            "newest demo run is used automatically"
+        ),
+    )
     parser.add_argument("--ddim-steps", type=int, default=25)
     parser.add_argument("--guidance-fraction", type=float, default=0.40)
     parser.add_argument("--guidance-scale", type=float, default=0.020)
@@ -101,8 +114,70 @@ def _quaternion_to_matrix(quaternion_wxyz: np.ndarray) -> np.ndarray:
     )
 
 
+def _load_accepted_pair(pair_attempts_path: Path) -> dict:
+    payload = json.loads(pair_attempts_path.read_text(encoding="utf-8"))
+    records = (
+        payload
+        if isinstance(payload, list)
+        else payload.get("pair_attempts", [])
+    )
+    for record in records:
+        if record.get("result") == "accepted":
+            return record
+    raise RuntimeError(f"no accepted pair in {pair_attempts_path}")
+
+
+def _resolve_endpoints(
+    args: argparse.Namespace,
+) -> tuple[list[float], list[float], int]:
+    """Return (start_pose, goal_pose, seed) from explicit args or a demo run."""
+
+    explicit = (
+        args.start_pose is not None
+        and args.goal_pose is not None
+        and args.seed is not None
+    )
+    demo_dir = args.demo_dir
+    if demo_dir is None and not explicit:
+        candidates = sorted(
+            PROJECT_DIR.glob("results/unet_guidance_demo_*/pair_attempts.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for candidate in candidates:
+            try:
+                _load_accepted_pair(candidate)
+                demo_dir = candidate.parent
+                break
+            except RuntimeError:
+                continue
+    if demo_dir is not None:
+        record = _load_accepted_pair(demo_dir / "pair_attempts.json")
+        start = list(record["start_pose"])
+        goal = list(record["goal_pose"])
+        seed = int(record["sampler_seed"])
+        print(
+            f"using demo run {demo_dir.name}: seed={seed} "
+            f"(start={[round(v, 3) for v in start]}, "
+            f"goal={[round(v, 3) for v in goal]})",
+            flush=True,
+        )
+        return start, goal, seed
+    if explicit:
+        return (
+            list(args.start_pose),
+            list(args.goal_pose),
+            int(args.seed),
+        )
+    raise SystemExit(
+        "provide --start-pose/--goal-pose/--seed, --demo-dir, or leave all "
+        "empty to reuse the newest demo run"
+    )
+
+
 def main() -> None:
     args = parse_args()
+    start, goal, seed = _resolve_endpoints(args)
     cuda = torch.cuda.is_available()
     device = torch.device(
         "cuda"
@@ -157,8 +232,9 @@ def main() -> None:
         clearance_m=args.guidance_clearance,
     )
 
-    start = np.asarray(args.start_pose, dtype=np.float64)
-    goal = np.asarray(args.goal_pose, dtype=np.float64)
+    start = np.asarray(start, dtype=np.float64)
+    goal = np.asarray(goal, dtype=np.float64)
+    args.seed = int(seed)
     pose9 = pose7_to_pose9(np.stack((start, goal))).astype(np.float32)
     raw_condition = np.concatenate((pose9[0], pose9[1]))
     conditions = torch.from_numpy(
@@ -182,11 +258,9 @@ def main() -> None:
             )
         )
 
-    generator = torch.Generator(device=device).manual_seed(args.seed)
+    generator = torch.Generator(device=device).manual_seed(seed)
     if device.type == "cuda":
-        warmup_generator = torch.Generator(device=device).manual_seed(
-            args.seed + 1
-        )
+        warmup_generator = torch.Generator(device=device).manual_seed(seed + 1)
         _ = ddim_sample(
             model, conditions, schedule, sequence_length,
             min(5, args.ddim_steps), obstacles, obstacle_mask, mean, std,
@@ -266,7 +340,7 @@ def main() -> None:
 
     with rr.RecordingStream(
         "diffusion_step_replay",
-        recording_id=f"diffusion_steps_seed{args.seed}",
+        recording_id=f"diffusion_steps_seed{seed}",
     ) as recording:
         recording.save(output)
         recording.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
