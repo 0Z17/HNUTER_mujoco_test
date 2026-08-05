@@ -1058,6 +1058,7 @@ def ddim_sample(
     esdf: EsdfDistanceField | None = None,
     robot_sphere_centers: Tensor | None = None,
     robot_sphere_radii: Tensor | None = None,
+    on_step: Any | None = None,
 ) -> Tensor:
     device = conditions.device
     path = torch.randn(
@@ -1110,6 +1111,8 @@ def ddim_sample(
             ) / torch.sqrt(1.0 - alpha_bar)
         if sample_index == len(indices) - 1:
             path = predicted_x0
+            if on_step is not None:
+                on_step(sample_index, int(timestep_value), path, predicted_x0)
             continue
         previous = indices[sample_index + 1]
         previous_alpha_bar = schedule.alpha_bars[previous]
@@ -1118,4 +1121,6 @@ def ddim_sample(
             + torch.sqrt(1.0 - previous_alpha_bar) * predicted_noise
         )
         path = hard_clamp_endpoints(path, conditions)
+        if on_step is not None:
+            on_step(sample_index, int(timestep_value), path, predicted_x0)
     return hard_clamp_endpoints(path, conditions)
