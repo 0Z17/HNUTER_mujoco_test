@@ -150,6 +150,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ddim-steps",
+        type=int,
+        default=25,
+        help="number of inference DDIM denoising steps (<= training steps)",
+    )
+    parser.add_argument(
         "pipeline_args", nargs=argparse.REMAINDER,
         help="extra execution-pipeline arguments after --",
     )
@@ -403,6 +409,7 @@ class SamplerClient:
             "--environment", str(args.environment.expanduser().resolve()),
             "--spheres", str(args.curobo_spheres.expanduser().resolve()),
             "--activation-distance", str(args.acceptance_clearance),
+            "--ddim-steps", str(args.ddim_steps),
             "--device", "auto",
         ]
         if args.esdf is not None:
@@ -505,12 +512,14 @@ class SamplerClient:
             "--environment", str(args.environment.expanduser().resolve()),
             "--spheres", str(args.curobo_spheres.expanduser().resolve()),
             "--activation-distance", str(args.acceptance_clearance),
+            "--ddim-steps", str(args.ddim_steps),
             "--output-dir", str(output_dir.expanduser().resolve()),
             "--start-pose", *map(str, np.asarray(start_pose, dtype=np.float64)),
             "--goal-pose", *map(str, np.asarray(goal_pose, dtype=np.float64)),
             "--candidate-count", str(candidate_count),
             "--sampling-batch-size", str(min(candidate_count, 32)),
             "--seed", str(seed),
+            "--ddim-steps", str(args.ddim_steps),
             "--device", "auto",
         ]
         if args.esdf is not None:
