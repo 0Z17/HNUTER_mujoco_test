@@ -961,8 +961,13 @@ def guidance_cost(path_normalized: Tensor, mean: Tensor, std: Tensor,
                   config: GuidanceConfig,
                   esdf: EsdfDistanceField | None = None,
                   robot_sphere_centers: Tensor | None = None,
-                  robot_sphere_radii: Tensor | None = None) -> Tensor:
+                  robot_sphere_radii: Tensor | None = None,
+                  evaluate_fn: Any | None = None) -> Tensor:
     path = path_normalized * std + mean
+    if evaluate_fn is not None:
+        # Control-point representation: evaluate the differentiable spline to
+        # a dense SE(3) path so all cost terms see trajectory geometry.
+        path = evaluate_fn(path)
     position = path[..., :3]
     if esdf is not None:
         if robot_sphere_centers is None or robot_sphere_radii is None:
@@ -1015,6 +1020,7 @@ def guided_prediction(
     esdf: EsdfDistanceField | None = None,
     robot_sphere_centers: Tensor | None = None,
     robot_sphere_radii: Tensor | None = None,
+    evaluate_fn: Any | None = None,
 ) -> Tensor:
     original = predicted_x0.detach()
     current = original
@@ -1026,6 +1032,7 @@ def guided_prediction(
             esdf=esdf,
             robot_sphere_centers=robot_sphere_centers,
             robot_sphere_radii=robot_sphere_radii,
+            evaluate_fn=evaluate_fn,
         ).sum()
         gradient = torch.autograd.grad(cost, current)[0]
         gradient[:, 0] = 0.0
@@ -1059,6 +1066,7 @@ def ddim_sample(
     robot_sphere_centers: Tensor | None = None,
     robot_sphere_radii: Tensor | None = None,
     on_step: Any | None = None,
+    evaluate_fn: Any | None = None,
 ) -> Tensor:
     device = conditions.device
     path = torch.randn(
@@ -1103,6 +1111,7 @@ def ddim_sample(
                     esdf=esdf,
                     robot_sphere_centers=robot_sphere_centers,
                     robot_sphere_radii=robot_sphere_radii,
+                    evaluate_fn=evaluate_fn,
                 )
             predicted_x0 = torch.clamp(predicted_x0, -clip_x0, clip_x0)
             predicted_x0 = hard_clamp_endpoints(predicted_x0, conditions)
