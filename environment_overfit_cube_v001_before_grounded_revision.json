@@ -1,0 +1,907 @@
+{
+  "schema_version": "1.1",
+  "environment_id": "overfit_cube_v001",
+  "description": "Moderate difficulty cube-only SE3 planning environment",
+  "random_seed": 20270802,
+  "units": {
+    "length": "meter",
+    "angle": "radian"
+  },
+  "coordinate_frame": {
+    "name": "world",
+    "handedness": "right",
+    "up_axis": "Z",
+    "forward_axis": "Y"
+  },
+  "bounds": {
+    "min": [
+      -2.0,
+      -3.5,
+      0.0
+    ],
+    "max": [
+      2.0,
+      3.5,
+      4.0
+    ]
+  },
+  "generation_parameters": {
+    "margin_ratio": 0.1,
+    "minimum_margin": 0.05,
+    "maximum_margin": 0.15,
+    "normal_passage_scale": 1.35,
+    "wide_passage_scale": 1.7,
+    "orientation_sensitive_scale": 1.1
+  },
+  "robot_reference": {
+    "source": "existing_phobos_collision_objects",
+    "base_link_candidates": [
+      "base_link",
+      "base_link_None",
+      "inertial_base_link"
+    ],
+    "base_link_object": "base_link",
+    "collision_object_names": [
+      "base_collision",
+      "l_leg_collision",
+      "l_rotor_collision",
+      "r_leg_collision",
+      "r_rotor_collision",
+      "tail_leg_collision",
+      "tail_rotoer_collision"
+    ],
+    "all_robot_collision_object_names": [
+      "base_collision",
+      "l_leg_collision",
+      "l_rotor_collision",
+      "r_leg_collision",
+      "r_rotor_collision",
+      "tail_leg_collision",
+      "tail_rotoer_collision"
+    ],
+    "movable_arm_collision_object_names": [],
+    "movable_arm_collisions_included": false,
+    "base_collision_aabb_local": {
+      "min": [
+        -0.96734,
+        -0.64747,
+        -0.312777
+      ],
+      "max": [
+        0.251215,
+        0.64747,
+        0.23348
+      ]
+    },
+    "base_collision_center_local": [
+      -0.358062,
+      0.0,
+      -0.039648
+    ],
+    "base_collision_size_xyz": [
+      1.218555,
+      1.29494,
+      0.546257
+    ],
+    "base_collision_max_horizontal_extent": 1.29494,
+    "base_horizontal_max": 1.29494,
+    "base_horizontal_min": 1.218555,
+    "base_collision_vertical_extent": 0.546257,
+    "base_vertical_extent": 0.546257,
+    "robot_default_configuration_collision_aabb_local": {
+      "min": [
+        -0.96734,
+        -0.64747,
+        -0.312777
+      ],
+      "max": [
+        0.251215,
+        0.64747,
+        0.23348
+      ]
+    },
+    "safety_margin": 0.129494,
+    "margin_ratio": 0.1
+  },
+  "sampling_space": {
+    "position_bounds": {
+      "min": [
+        -1.261229,
+        -2.723036,
+        0.402622
+      ],
+      "max": [
+        1.261229,
+        2.723036,
+        3.597378
+      ]
+    },
+    "orientation": {
+      "space": "SO3",
+      "sampling": "configured_by_dataset_generator"
+    },
+    "fixed_start_region": false,
+    "fixed_goal_region": false,
+    "requires_full_robot_collision_check": true,
+    "requires_start_goal_connectivity_check": true
+  },
+  "derived_design": {
+    "normal_passage_width": 1.645049,
+    "wide_passage_width": 2.071544,
+    "floor_clearance_opening": {
+      "min": [
+        -1.116834,
+        -0.796964,
+        -0.08
+      ],
+      "max": [
+        0.400709,
+        0.796964,
+        0.0
+      ],
+      "reason": "Preserves the current imported robot pose without modifying its transform"
+    }
+  },
+  "obstacles": [
+    {
+      "id": "env_floor_west_001",
+      "type": "box",
+      "pose": {
+        "position": [
+          -1.558417,
+          0.0,
+          -0.04
+        ],
+        "quaternion_wxyz": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "size_xyz": [
+        0.883166,
+        7.0,
+        0.08
+      ],
+      "half_extents": [
+        0.441583,
+        3.5,
+        0.04
+      ],
+      "collision": true,
+      "visual": true,
+      "static": true,
+      "role": "floor",
+      "collection": "FLOOR",
+      "tags": [
+        "cube_only",
+        "ground",
+        "current_pose_clearance"
+      ]
+    },
+    {
+      "id": "env_floor_east_001",
+      "type": "box",
+      "pose": {
+        "position": [
+          1.200354,
+          0.0,
+          -0.04
+        ],
+        "quaternion_wxyz": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "size_xyz": [
+        1.599291,
+        7.0,
+        0.08
+      ],
+      "half_extents": [
+        0.799646,
+        3.5,
+        0.04
+      ],
+      "collision": true,
+      "visual": true,
+      "static": true,
+      "role": "floor",
+      "collection": "FLOOR",
+      "tags": [
+        "cube_only",
+        "ground",
+        "current_pose_clearance"
+      ]
+    },
+    {
+      "id": "env_floor_south_001",
+      "type": "box",
+      "pose": {
+        "position": [
+          -0.358062,
+          -2.148482,
+          -0.04
+        ],
+        "quaternion_wxyz": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "size_xyz": [
+        1.517543,
+        2.703036,
+        0.08
+      ],
+      "half_extents": [
+        0.758771,
+        1.351518,
+        0.04
+      ],
+      "collision": true,
+      "visual": true,
+      "static": true,
+      "role": "floor",
+      "collection": "FLOOR",
+      "tags": [
+        "cube_only",
+        "ground",
+        "current_pose_clearance"
+      ]
+    },
+    {
+      "id": "env_floor_north_001",
+      "type": "box",
+      "pose": {
+        "position": [
+          -0.358062,
+          2.148482,
+          -0.04
+        ],
+        "quaternion_wxyz": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "size_xyz": [
+        1.517543,
+        2.703036,
+        0.08
+      ],
+      "half_extents": [
+        0.758771,
+        1.351518,
+        0.04
+      ],
+      "collision": true,
+      "visual": true,
+      "static": true,
+      "role": "floor",
+      "collection": "FLOOR",
+      "tags": [
+        "cube_only",
+        "ground",
+        "current_pose_clearance"
+      ]
+    },
+    {
+      "id": "env_pillar_floor_001",
+      "type": "box",
+      "pose": {
+        "position": [
+          -1.5,
+          -1.16,
+          0.95
+        ],
+        "quaternion_wxyz": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "size_xyz": [
+        0.310786,
+        0.310786,
+        1.9
+      ],
+      "half_extents": [
+        0.155393,
+        0.155393,
+        0.95
+      ],
+      "collision": true,
+      "visual": true,
+      "static": true,
+      "role": "pillar",
+      "collection": "PILLARS",
+      "tags": [
+        "cube_only",
+        "floor_supported",
+        "staggered"
+      ]
+    },
+    {
+      "id": "env_pillar_floor_002",
+      "type": "box",
+      "pose": {
+        "position": [
+          -0.66,
+          -0.86,
+          0.55
+        ],
+        "quaternion_wxyz": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "size_xyz": [
+        0.25,
+        0.25,
+        1.1
+      ],
+      "half_extents": [
+        0.125,
+        0.125,
+        0.55
+      ],
+      "collision": true,
+      "visual": true,
+      "static": true,
+      "role": "pillar",
+      "collection": "PILLARS",
+      "tags": [
+        "cube_only",
+        "floor_supported",
+        "staggered",
+        "low"
+      ]
+    },
+    {
+      "id": "env_pillar_hanging_001",
+      "type": "box",
+      "pose": {
+        "position": [
+          -1.34,
+          0.1,
+          3.4
+        ],
+        "quaternion_wxyz": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "size_xyz": [
+        0.3,
+        0.3,
+        1.2
+      ],
+      "half_extents": [
+        0.15,
+        0.15,
+        0.6
+      ],
+      "collision": true,
+      "visual": true,
+      "static": true,
+      "role": "pillar",
+      "collection": "PILLARS",
+      "tags": [
+        "cube_only",
+        "ceiling_suspended",
+        "staggered"
+      ]
+    },
+    {
+      "id": "env_pillar_hanging_002",
+      "type": "box",
+      "pose": {
+        "position": [
+          -1.06,
+          1.92,
+          3.6
+        ],
+        "quaternion_wxyz": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "size_xyz": [
+        0.26,
+        0.26,
+        0.8
+      ],
+      "half_extents": [
+        0.13,
+        0.13,
+        0.4
+      ],
+      "collision": true,
+      "visual": true,
+      "static": true,
+      "role": "pillar",
+      "collection": "PILLARS",
+      "tags": [
+        "cube_only",
+        "ceiling_suspended",
+        "staggered"
+      ]
+    },
+    {
+      "id": "env_gate_left_001",
+      "type": "box",
+      "pose": {
+        "position": [
+          -0.578058,
+          -2.818675,
+          0.725
+        ],
+        "quaternion_wxyz": [
+          0.978148,
+          0.0,
+          0.0,
+          0.207912
+        ]
+      },
+      "size_xyz": [
+        0.284887,
+        0.24,
+        1.45
+      ],
+      "half_extents": [
+        0.142443,
+        0.12,
+        0.725
+      ],
+      "collision": true,
+      "visual": true,
+      "static": true,
+      "role": "gate_post",
+      "collection": "GATES",
+      "tags": [
+        "cube_only",
+        "floor_supported",
+        "orientation_sensitive"
+      ]
+    },
+    {
+      "id": "env_gate_right_001",
+      "type": "box",
+      "pose": {
+        "position": [
+          1.078058,
+          -2.081325,
+          0.725
+        ],
+        "quaternion_wxyz": [
+          0.978148,
+          0.0,
+          0.0,
+          0.207912
+        ]
+      },
+      "size_xyz": [
+        0.284887,
+        0.24,
+        1.45
+      ],
+      "half_extents": [
+        0.142443,
+        0.12,
+        0.725
+      ],
+      "collision": true,
+      "visual": true,
+      "static": true,
+      "role": "gate_post",
+      "collection": "GATES",
+      "tags": [
+        "cube_only",
+        "floor_supported",
+        "orientation_sensitive"
+      ]
+    },
+    {
+      "id": "env_gate_top_001",
+      "type": "box",
+      "pose": {
+        "position": [
+          0.25,
+          -2.45,
+          1.58
+        ],
+        "quaternion_wxyz": [
+          0.978148,
+          0.0,
+          0.0,
+          0.207912
+        ]
+      },
+      "size_xyz": [
+        2.097731,
+        0.24,
+        0.26
+      ],
+      "half_extents": [
+        1.048865,
+        0.12,
+        0.13
+      ],
+      "collision": true,
+      "visual": true,
+      "static": true,
+      "role": "gate_beam",
+      "collection": "GATES",
+      "tags": [
+        "cube_only",
+        "overhead",
+        "orientation_sensitive"
+      ]
+    },
+    {
+      "id": "env_center_block_001",
+      "type": "box",
+      "pose": {
+        "position": [
+          -0.05,
+          1.08,
+          0.9
+        ],
+        "quaternion_wxyz": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "size_xyz": [
+        0.75,
+        0.58,
+        1.8
+      ],
+      "half_extents": [
+        0.375,
+        0.29,
+        0.9
+      ],
+      "collision": true,
+      "visual": true,
+      "static": true,
+      "role": "central_block",
+      "collection": "CENTRAL_OBSTACLES",
+      "tags": [
+        "cube_only",
+        "floor_supported",
+        "left_right_bypass",
+        "overflight"
+      ]
+    },
+    {
+      "id": "env_offset_pillar_001",
+      "type": "box",
+      "pose": {
+        "position": [
+          1.43,
+          1.62,
+          0.65
+        ],
+        "quaternion_wxyz": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "size_xyz": [
+        0.26,
+        0.26,
+        1.3
+      ],
+      "half_extents": [
+        0.13,
+        0.13,
+        0.65
+      ],
+      "collision": true,
+      "visual": true,
+      "static": true,
+      "role": "offset_pillar",
+      "collection": "CENTRAL_OBSTACLES",
+      "tags": [
+        "cube_only",
+        "floor_supported",
+        "asymmetric_route"
+      ]
+    },
+    {
+      "id": "env_beam_001",
+      "type": "box",
+      "pose": {
+        "position": [
+          0.2,
+          2.63,
+          2.28
+        ],
+        "quaternion_wxyz": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "size_xyz": [
+        1.2,
+        0.26,
+        0.24
+      ],
+      "half_extents": [
+        0.6,
+        0.13,
+        0.12
+      ],
+      "collision": true,
+      "visual": true,
+      "static": true,
+      "role": "suspended_beam",
+      "collection": "BEAMS",
+      "tags": [
+        "cube_only",
+        "overhead",
+        "underpass",
+        "overflight",
+        "side_bypass"
+      ]
+    },
+    {
+      "id": "env_low_block_001",
+      "type": "box",
+      "pose": {
+        "position": [
+          0.61,
+          2.28,
+          0.35
+        ],
+        "quaternion_wxyz": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "size_xyz": [
+        0.55,
+        0.42,
+        0.7
+      ],
+      "half_extents": [
+        0.275,
+        0.21,
+        0.35
+      ],
+      "collision": true,
+      "visual": true,
+      "static": true,
+      "role": "low_block",
+      "collection": "BEAMS",
+      "tags": [
+        "cube_only",
+        "floor_supported",
+        "breaks_vertical_symmetry"
+      ]
+    },
+    {
+      "id": "env_partial_wall_back_001",
+      "type": "box",
+      "pose": {
+        "position": [
+          1.43,
+          0.18,
+          0.5
+        ],
+        "quaternion_wxyz": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "size_xyz": [
+        0.16,
+        1.1,
+        1.0
+      ],
+      "half_extents": [
+        0.08,
+        0.55,
+        0.5
+      ],
+      "collision": true,
+      "visual": true,
+      "static": true,
+      "role": "partial_wall",
+      "collection": "PARTIAL_ENCLOSURES",
+      "tags": [
+        "cube_only",
+        "floor_supported",
+        "partial_enclosure"
+      ]
+    },
+    {
+      "id": "env_partial_wall_south_001",
+      "type": "box",
+      "pose": {
+        "position": [
+          1.1,
+          -0.29,
+          0.5
+        ],
+        "quaternion_wxyz": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "size_xyz": [
+        0.5,
+        0.16,
+        1.0
+      ],
+      "half_extents": [
+        0.25,
+        0.08,
+        0.5
+      ],
+      "collision": true,
+      "visual": true,
+      "static": true,
+      "role": "partial_wall",
+      "collection": "PARTIAL_ENCLOSURES",
+      "tags": [
+        "cube_only",
+        "floor_supported",
+        "wide_exit"
+      ]
+    },
+    {
+      "id": "env_partial_wall_north_001",
+      "type": "box",
+      "pose": {
+        "position": [
+          1.17,
+          0.65,
+          0.325
+        ],
+        "quaternion_wxyz": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "size_xyz": [
+        0.36,
+        0.16,
+        0.65
+      ],
+      "half_extents": [
+        0.18,
+        0.08,
+        0.325
+      ],
+      "collision": true,
+      "visual": true,
+      "static": true,
+      "role": "partial_wall",
+      "collection": "PARTIAL_ENCLOSURES",
+      "tags": [
+        "cube_only",
+        "floor_supported",
+        "height_limited_exit"
+      ]
+    }
+  ],
+  "passages": [
+    {
+      "id": "passage_gate_001",
+      "type": "doorway",
+      "clearance_size_xyz": [
+        1.527957,
+        0.24,
+        1.45
+      ],
+      "difficulty": "orientation_sensitive",
+      "orientation_sensitive": true,
+      "orientation_sensitive_bounds": {
+        "short_axis_conservative_width": 1.477543,
+        "long_axis_conservative_width": 1.553928,
+        "gate_rotation_radians": 0.418879
+      },
+      "alternative_routes": [
+        "side",
+        "above"
+      ]
+    },
+    {
+      "id": "passage_beam_001",
+      "type": "suspended_beam",
+      "clearance_size_xyz": [
+        4.0,
+        0.3,
+        2.14
+      ],
+      "difficulty": "medium",
+      "orientation_sensitive": false,
+      "alternative_routes": [
+        "under",
+        "above",
+        "left_side"
+      ]
+    },
+    {
+      "id": "passage_partial_001",
+      "type": "partial_enclosure",
+      "clearance_size_xyz": [
+        1.0,
+        1.0,
+        1.3
+      ],
+      "difficulty": "medium",
+      "orientation_sensitive": false,
+      "alternative_routes": [
+        "wide_west_exit",
+        "above_north_wall",
+        "outside_bypass"
+      ]
+    }
+  ],
+  "validation": {
+    "objects_have_unique_ids": true,
+    "environment_scales_applied": true,
+    "robot_model_unchanged": true,
+    "current_robot_pose_collision_free": true,
+    "current_robot_pose_check_type": "conservative_world_AABB",
+    "current_robot_pose_overlap_names": [],
+    "aabb_overlap_warnings": [],
+    "xml_well_formed": true,
+    "mujoco_load_check": "not_available: Python mujoco module is not installed in Blender",
+    "obstacle_count": 18,
+    "collection_counts": {
+      "BEAMS": 2,
+      "CENTRAL_OBSTACLES": 2,
+      "FLOOR": 4,
+      "GATES": 3,
+      "PARTIAL_ENCLOSURES": 3,
+      "PILLARS": 4
+    },
+    "voxel_resolution": 0.18,
+    "grid_shape": [
+      15,
+      31,
+      18
+    ],
+    "grid_free_ratio": 0.4114695340501792,
+    "free_space_component_count": 1,
+    "largest_free_space_component_ratio": 1.0,
+    "coarse_free_sample_ratio": 0.3973333333333333,
+    "random_sample_count": 1500,
+    "connectivity_notes": [
+      "Occupancy uses conservatively inflated box geometry and 6-connected voxels.",
+      "The check is geometric screening, not a replacement for full-robot SE(3) collision checking.",
+      "The central floor opening exists only to keep the unchanged imported robot pose collision-free."
+    ]
+  }
+}
